@@ -4,8 +4,8 @@
 #include <LittleFS.h>
 #include <time.h>
 
-#define LED_PIN    D4
-#define NUM_DIGITS 4
+#define LED_PIN     D4
+#define NUM_DIGITS  4
 #define NUM_SEGMENTS 7
 #define LEDS_PER_SEG 2
 #define NUM_LEDS 56
@@ -21,7 +21,9 @@ String rbl = "";
 String lastDisplayValue = "----";
 String apiLog = "";
 unsigned long lastUpdate = 0;
+unsigned long lastSecTick = 0;
 int secondsToBus = 0;
+bool blinkState = false;
 
 const uint8_t digitSegmentMap[NUM_DIGITS][14] = {
   { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13 },
@@ -42,6 +44,8 @@ const uint8_t digitPatterns[10][7] = {
   {1,1,1,1,1,1,1}, // 8
   {1,1,1,1,0,1,1}  // 9
 };
+// Minus: Segment 6 = Mitte unten (counted from 0)
+const uint8_t minusSeg[14] = {6, 20}; // Segment 6 in Digit 0 und 1
 
 // ---------- LittleFS Konfig speichern/lesen ----------
 void saveConfig() {
@@ -84,7 +88,7 @@ void loadConfig() {
   Serial.println("RBL: " + rbl);
 }
 
-// Hilfsfunktion: ISO nach Unixzeit (ab jetzt ohne Offsetkorrektur!)
+// Hilfsfunktion: ISO nach Unixzeit, keine Offsetkorrektur!
 time_t parseISOTimestamp(String iso){
   int year   = iso.substring(0,4).toInt();
   int month  = iso.substring(5,7).toInt();
@@ -100,10 +104,10 @@ time_t parseISOTimestamp(String iso){
   t.tm_min  = minute;
   t.tm_sec = second;
   t.tm_isdst = -1;
-  return mktime(&t); // ohne Offset!
+  return mktime(&t); // keine Offsetkorrektur!
 }
 
-// ---------- Webserver Seiten ----------
+// Webserver Seiten
 void handleRoot() {
   String html = "<h2>Wemos D1 Mini Anzeigen-Konfiguration</h2>";
   html += "<form action='/save' method='POST'>"
@@ -136,12 +140,29 @@ void handleSave() {
 
 void handleStatus() {
   String html = "<h2>Aktuelle LED-Anzeige:</h2>";
-  html += "<div style='color:green;font-size:2em;font-weight:bold'>" + lastDisplayValue + "</div>";
+  html += "<div id='countdown' style='color:green;font-size:2em;font-weight:bold'>";
+  html += lastDisplayValue;
+  html += "</div>";
+  html +=
+    "<script>var sec="+String(secondsToBus)+";\
+     var el=document.getElementById('countdown');\
+     function update(){\
+       if(sec>0){\
+         var min=Math.floor(sec/60);\
+         var s=sec%60;\
+         el.innerHTML=('0'+min).slice(-2)+\":\"+('0'+s).slice(-2);\
+         sec--;\
+       }else{el.innerHTML='--';}\
+     }\
+     setInterval(update,1000);\
+     update();\
+    </script>";
   html += "<h3>API Log:</h3>";
   html += "<textarea rows='20' cols='75' readonly>" + apiLog + "</textarea>";
   html += "<br><a href='/'>Zurück zur Konfiguration</a>";
   server.send(200, "text/html", html);
 }
+
 
 void connectWifi() {
   Serial.println("Verbinde mit WLAN...");
@@ -152,27 +173,25 @@ void connectWifi() {
   }
   if (WiFi.status()==WL_CONNECTED) {
     Serial.println("\nVerbunden! IP: " + WiFi.localIP().toString());
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Hole UTC-Zeit
-    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);     // Stelle Zone auf "Europe/Vienna"
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // Europa/Wien Sommer/Winter automatisch
     tzset();
     time_t now = time(nullptr);
-    Serial.print("ESP Systemzeit jetzt (lokal Wien): ");
     Serial.println(ctime(&now));
   } else {
     Serial.println("\nWLAN Fehler!");
   }
 }
 
-// ---------- API-Aufruf und sekunden-genaue Berechnung ----------
 int fetchBusCountdown(String rbl, String key) {
   WiFiClientSecure client;
   client.setInsecure();
   String url = "/ogd_realtime/monitor?rbl=" + rbl +
                "&activateTrafficInfo=stoerungkurz&sender=" + key;
 
-  char tbuf[10];
   time_t now = time(nullptr);
-  struct tm *tm_ = localtime(&now); // Jetzt: lokale Zeit in Wien!
+  struct tm *tm_ = localtime(&now); 
+  char tbuf[10];
   sprintf(tbuf, "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
 
   if (!client.connect("www.wienerlinien.at", 443)) {
@@ -194,30 +213,38 @@ int fetchBusCountdown(String rbl, String key) {
 
   apiLog += "[" + String(tbuf) + "] API Payload:\n";
   apiLog += payload + "\n";
-  Serial.printf("[%s] API-Payload:\n", tbuf);
-  Serial.println(payload);
 
-  // Extrahiere timeReal des ersten Departures
   int idxReal = payload.indexOf("\"timeReal\":\"");
   String real = "";
   if (idxReal > 0) {
     real = payload.substring(idxReal + 12, idxReal + 12 + 24);
   }
 
-  // Sekundengenauer Countdown ab jetzt zur tatsächlichen Abfahrt (jetzt lokaler Vergleich!)
-  time_t tReal = parseISOTimestamp(real);        // lokale Zeit
-  time_t nowTime = time(nullptr);                // ESP = lokale Zeit
+  time_t tReal = parseISOTimestamp(real);     
+  time_t nowTime = time(nullptr);             
   long countSeconds = tReal - nowTime;
   if (countSeconds < 0) countSeconds = 0;
 
   apiLog += "--- Sekundengenauer Countdown ab jetzt: " + String(countSeconds) + " ---\n\n";
   if (apiLog.length() > 6000) apiLog = apiLog.substring(apiLog.length()-6000);
 
-  Serial.printf("Parsed timeReal (lokal): %s\n", asctime(localtime(&tReal)));
-  Serial.printf("ESP time now   (lokal): %s\n", asctime(localtime(&nowTime)));
-  Serial.printf("Delta: %ld Sek.\n", countSeconds);
-
   return countSeconds;
+}
+
+// Neue Funktion: LED zeigt zwei blinkende Minus!
+void displayBlinkMinus(bool state) {
+  strip.clear();
+  if (state) {
+    // Minus links (Digit 0, Segment 6)
+    for(int l=0; l<LEDS_PER_SEG; l++) 
+      strip.setPixelColor(digitSegmentMap[0][6*LEDS_PER_SEG+l], strip.Color(0,0,255));
+  } else {
+    // Minus rechts (Digit 1, Segment 6)
+    for(int l=0; l<LEDS_PER_SEG; l++) 
+      strip.setPixelColor(digitSegmentMap[1][6*LEDS_PER_SEG+l], strip.Color(0,0,255));
+  }
+  strip.show();
+  lastDisplayValue = "--";
 }
 
 void displayCountdown(int seconds){
@@ -230,17 +257,13 @@ void displayCountdown(int seconds){
   lastDisplayValue = String(buf);
 
   int digits[4] = { min/10, min%10, sec/10, sec%10 };
-  Serial.print("LED-Anzeige: ");
-  Serial.println(lastDisplayValue);
-
+  strip.clear();
   for(int d=0; d<NUM_DIGITS; d++){
     for(int s=0; s<NUM_SEGMENTS; s++){
       for(int l=0; l<LEDS_PER_SEG; l++){
         int ledIndex = digitSegmentMap[d][s*LEDS_PER_SEG+l];
         if(digits[d] >= 0 && digits[d] <= 9 && digitPatterns[digits[d]][s])
           strip.setPixelColor(ledIndex, strip.Color(0,255,0));
-        else
-          strip.setPixelColor(ledIndex, 0);
       }
     }
   }
@@ -275,11 +298,26 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  if(ssid == "" || WiFi.status() != WL_CONNECTED) return;
-
+  static int secCounter = 0;
+  // API aktualisieren alle 20s
   if(millis()-lastUpdate > 20000) {
     secondsToBus = fetchBusCountdown(rbl, apiKey);
-    displayCountdown(secondsToBus);
     lastUpdate = millis();
+    secCounter = 0;
+  }
+  // Sekundenzähler anzeigen
+  if(secondsToBus > 0) {
+    if(millis()-lastSecTick > 1000) {
+      secondsToBus--;
+      displayCountdown(secondsToBus);
+      lastSecTick = millis();
+    }
+  } else {
+    // Abwechselndes Minus blinken, bei 0 angekommen
+    if(millis()-lastSecTick > 666) {
+      blinkState = !blinkState;
+      displayBlinkMinus(blinkState);
+      lastSecTick = millis();
+    }
   }
 }
