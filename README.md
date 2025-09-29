@@ -27,6 +27,7 @@ Zeigt die Restzeit bis zur nächsten Abfahrt (Wiener Linien **OGD Realtime**), h
 
 ## Hardware
 
+- **7-Segment-Gehäuse:** https://makerworld.com/de/models/892517-7-segment-clock-for-led-strips?from=search#profileId-849334
 - **Controller:** Wemos D1 mini (ESP8266)
 - **LEDs:** WS2812B/NeoPixel (56 LEDs → 4 Digits × 7 Segmente × 2 LEDs/Segment)
 - **Widerstand:** 330–470 Ω in Serie im **Data‑Pin** (nahe am ersten LED)
@@ -155,6 +156,6 @@ MIT
 
 ## Credits
 
-- CAD/3D & Integration: **Alex**
+- CAD/3D & Integration: [**26110lwcc**](https://makerworld.com/de/@26110lwcc)
 - Libraries: Adafruit NeoPixel, ArduinoJson
 - Daten: Wiener Linien OGD Realtime
