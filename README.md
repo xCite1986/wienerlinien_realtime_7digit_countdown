@@ -44,7 +44,9 @@ Zeigt die Restzeit bis zur nächsten Abfahrt (Wiener Linien **OGD Realtime**), h
 
 - 4‑stellige 7‑Segment‑Maske mit 2 LEDs pro Segment (insgesamt 56 LEDs).
 - Schwarze Separatoren reduzieren Lichtübersprechen; Diffusor weiß/transparent.
-- **Foto/LED‑Pfad:** _Hier ergänzen._
+- **Foto/LED‑Pfad:**
+
+<img width="1527" height="706" alt="2025-09-29_09h14_15" src="https://github.com/user-attachments/assets/ff1b70bc-2152-45a6-9f67-ccca70d24c61" />
 
 ---
 
