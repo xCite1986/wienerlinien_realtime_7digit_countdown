@@ -84,7 +84,7 @@ void loadConfig() {
   Serial.println("RBL: " + rbl);
 }
 
-// ---------- Hilfsfunktion: ISO nach Unixzeit (mit Offsetkorrektur) ----------
+// Hilfsfunktion: ISO nach Unixzeit (ab jetzt ohne Offsetkorrektur!)
 time_t parseISOTimestamp(String iso){
   int year   = iso.substring(0,4).toInt();
   int month  = iso.substring(5,7).toInt();
@@ -100,16 +100,7 @@ time_t parseISOTimestamp(String iso){
   t.tm_min  = minute;
   t.tm_sec = second;
   t.tm_isdst = -1;
-  time_t unixTime = mktime(&t);
-  // Offset aus "+0200" oder "-0100" abziehen, damit UTC-Zeit entsteht!
-  int tzSign = (iso.indexOf('+')>=0) ? 1 : -1;
-  int tzPos = iso.lastIndexOf('+');
-  if(tzPos < 0) tzPos = iso.lastIndexOf('-');
-  int tzHour = iso.substring(tzPos+1, tzPos+3).toInt();
-  int tzMin  = iso.substring(tzPos+3, tzPos+5).toInt();
-  int tzOffset = tzSign * (tzHour*3600 + tzMin*60);
-  unixTime -= tzOffset;
-  return unixTime;
+  return mktime(&t); // ohne Offset!
 }
 
 // ---------- Webserver Seiten ----------
@@ -161,7 +152,12 @@ void connectWifi() {
   }
   if (WiFi.status()==WL_CONNECTED) {
     Serial.println("\nVerbunden! IP: " + WiFi.localIP().toString());
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // ESP Zeit = UTC!
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Hole UTC-Zeit
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);     // Stelle Zone auf "Europe/Vienna"
+    tzset();
+    time_t now = time(nullptr);
+    Serial.print("ESP Systemzeit jetzt (lokal Wien): ");
+    Serial.println(ctime(&now));
   } else {
     Serial.println("\nWLAN Fehler!");
   }
@@ -176,7 +172,7 @@ int fetchBusCountdown(String rbl, String key) {
 
   char tbuf[10];
   time_t now = time(nullptr);
-  struct tm *tm_ = gmtime(&now);
+  struct tm *tm_ = localtime(&now); // Jetzt: lokale Zeit in Wien!
   sprintf(tbuf, "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
 
   if (!client.connect("www.wienerlinien.at", 443)) {
@@ -208,16 +204,19 @@ int fetchBusCountdown(String rbl, String key) {
     real = payload.substring(idxReal + 12, idxReal + 12 + 24);
   }
 
-  // Sekundengenauer Countdown ab jetzt zur tatsächlichen Abfahrt (immer >=0)
-  time_t tReal = parseISOTimestamp(real);        // UTC
-  time_t nowTime = time(nullptr);                // ESP = UTC (configTime(0,0,...))
+  // Sekundengenauer Countdown ab jetzt zur tatsächlichen Abfahrt (jetzt lokaler Vergleich!)
+  time_t tReal = parseISOTimestamp(real);        // lokale Zeit
+  time_t nowTime = time(nullptr);                // ESP = lokale Zeit
   long countSeconds = tReal - nowTime;
   if (countSeconds < 0) countSeconds = 0;
 
   apiLog += "--- Sekundengenauer Countdown ab jetzt: " + String(countSeconds) + " ---\n\n";
   if (apiLog.length() > 6000) apiLog = apiLog.substring(apiLog.length()-6000);
 
-  Serial.printf("Sekundengenauer Countdown ab jetzt: %ld\n\n", countSeconds);
+  Serial.printf("Parsed timeReal (lokal): %s\n", asctime(localtime(&tReal)));
+  Serial.printf("ESP time now   (lokal): %s\n", asctime(localtime(&nowTime)));
+  Serial.printf("Delta: %ld Sek.\n", countSeconds);
+
   return countSeconds;
 }
 
