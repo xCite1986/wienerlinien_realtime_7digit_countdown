@@ -84,7 +84,7 @@ void loadConfig() {
   Serial.println("RBL: " + rbl);
 }
 
-// ---------- Hilfsfunktion: ISO nach Unixzeit ----------
+// ---------- Hilfsfunktion: ISO nach Unixzeit (mit Offsetkorrektur) ----------
 time_t parseISOTimestamp(String iso){
   int year   = iso.substring(0,4).toInt();
   int month  = iso.substring(5,7).toInt();
@@ -98,12 +98,13 @@ time_t parseISOTimestamp(String iso){
   t.tm_mday = day;
   t.tm_hour = hour;
   t.tm_min  = minute;
-  t.tm_sec  = second;
+  t.tm_sec = second;
   t.tm_isdst = -1;
   time_t unixTime = mktime(&t);
+  // Offset aus "+0200" oder "-0100" abziehen, damit UTC-Zeit entsteht!
   int tzSign = (iso.indexOf('+')>=0) ? 1 : -1;
   int tzPos = iso.lastIndexOf('+');
-  if(tzPos<0) tzPos = iso.lastIndexOf('-');
+  if(tzPos < 0) tzPos = iso.lastIndexOf('-');
   int tzHour = iso.substring(tzPos+1, tzPos+3).toInt();
   int tzMin  = iso.substring(tzPos+3, tzPos+5).toInt();
   int tzOffset = tzSign * (tzHour*3600 + tzMin*60);
@@ -160,7 +161,7 @@ void connectWifi() {
   }
   if (WiFi.status()==WL_CONNECTED) {
     Serial.println("\nVerbunden! IP: " + WiFi.localIP().toString());
-    configTime(1 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // ESP Zeit = UTC!
   } else {
     Serial.println("\nWLAN Fehler!");
   }
@@ -175,7 +176,7 @@ int fetchBusCountdown(String rbl, String key) {
 
   char tbuf[10];
   time_t now = time(nullptr);
-  struct tm *tm_ = localtime(&now);
+  struct tm *tm_ = gmtime(&now);
   sprintf(tbuf, "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
 
   if (!client.connect("www.wienerlinien.at", 443)) {
@@ -200,35 +201,31 @@ int fetchBusCountdown(String rbl, String key) {
   Serial.printf("[%s] API-Payload:\n", tbuf);
   Serial.println(payload);
 
-  // Extrahiere timePlanned und timeReal des ersten Departures
-  int idxPlanned = payload.indexOf("\"timePlanned\":\"");
-  String planned = "";
-  if (idxPlanned > 0) {
-    planned = payload.substring(idxPlanned + 15, idxPlanned + 15 + 24);
-  }
+  // Extrahiere timeReal des ersten Departures
   int idxReal = payload.indexOf("\"timeReal\":\"");
   String real = "";
   if (idxReal > 0) {
     real = payload.substring(idxReal + 12, idxReal + 12 + 24);
   }
-  // Sekundengenauer Unterschied
-  long countSeconds = -2; // Fallback
-  if(planned.length()==24 && real.length()==24){
-    time_t tPlanned = parseISOTimestamp(planned);
-    time_t tReal    = parseISOTimestamp(real);
-    countSeconds = tPlanned - tReal;
-  }
 
-  apiLog += "--- Sekundengenauer Countdown: " + String(countSeconds) + " ---\n\n";
+  // Sekundengenauer Countdown ab jetzt zur tatsächlichen Abfahrt (immer >=0)
+  time_t tReal = parseISOTimestamp(real);        // UTC
+  time_t nowTime = time(nullptr);                // ESP = UTC (configTime(0,0,...))
+  long countSeconds = tReal - nowTime;
+  if (countSeconds < 0) countSeconds = 0;
+
+  apiLog += "--- Sekundengenauer Countdown ab jetzt: " + String(countSeconds) + " ---\n\n";
   if (apiLog.length() > 6000) apiLog = apiLog.substring(apiLog.length()-6000);
 
-  Serial.printf("Sekundengenauer Countdown: %ld\n\n", countSeconds);
+  Serial.printf("Sekundengenauer Countdown ab jetzt: %ld\n\n", countSeconds);
   return countSeconds;
 }
 
 void displayCountdown(int seconds){
   int min = seconds / 60;
   int sec = seconds % 60;
+  if (min < 0) min = 0;
+  if (sec < 0) sec = 0;
   char buf[6];
   sprintf(buf, "%02d:%02d", min, sec);
   lastDisplayValue = String(buf);
@@ -281,7 +278,7 @@ void loop() {
 
   if(ssid == "" || WiFi.status() != WL_CONNECTED) return;
 
-  if(millis()-lastUpdate > 5000) {
+  if(millis()-lastUpdate > 20000) {
     secondsToBus = fetchBusCountdown(rbl, apiKey);
     displayCountdown(secondsToBus);
     lastUpdate = millis();
