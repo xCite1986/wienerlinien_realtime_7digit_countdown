@@ -267,172 +267,267 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
 <script>
 (() => {
-  const $ = s => document.querySelector(s);
-  const toast = (m, ok=true) => { const t=$('#toast'); t.textContent=m; t.className='toast'+(ok?'':' err'); t.style.display='block'; setTimeout(()=>t.style.display='none', 3000); };
-  const hex2rgb = h => { const x=h.replace('#',''); return [parseInt(x.slice(0,2),16),parseInt(x.slice(2,4),16),parseInt(x.slice(4,6),16)]; };
-  const rgb2hex = (r,g,b) => '#'+[r,g,b].map(v=>('0'+v.toString(16)).slice(-2)).join('');
-  const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
-
-  // --- Edit-Locks: verhindern Überschreiben während Eingabe ---
-  const editing = {
-    cLow:false, cMid:false, cHigh:false,
-    tLow:false, tMid:false,
-    bright:false
+  // ---------- Helpers ----------
+  const $  = (s) => document.querySelector(s);
+  const $$ = (s) => Array.from(document.querySelectorAll(s));
+  const toast = (m, ok = true) => {
+    const t = $('#toast');
+    t.textContent = m;
+    t.className = 'toast' + (ok ? '' : ' err');
+    t.style.display = 'block';
+    setTimeout(() => (t.style.display = 'none'), 3500);
   };
-  const lockOn = id => editing[id]=true;
-  const lockOff = id => editing[id]=false;
-  const setIfIdle = (id, setter) => { if(!editing[id]) setter(); };
-
-  // --- Color preview helpers ---
-  const setPreview = (el, hex) => { el.style.setProperty('--bar', hex); };
-  const updateAllPreviews = () => {
-    setPreview($('#pLow'),  $('#cLow').value);
-    setPreview($('#pMid'),  $('#cMid').value);
-    setPreview($('#pHigh'), $('#cHigh').value);
+  const hex2rgb = (h) => {
+    const x = h.replace('#', '');
+    return [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2, 4), 16), parseInt(x.slice(4, 6), 16)];
   };
+  const rgb2hex = (r, g, b) => '#' + [r, g, b].map(v => ('0' + (v|0).toString(16)).slice(-2)).join('');
+  const fmt = (s) => (String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'));
 
-  // ---- State ----
-  let secondsRemaining = 0, mode='countdown', syncCountdown=0, timeSynced=false;
-  let standby=false;
-  let suppressServerOverwriteUntil = 0; // ms
+  // ---------- Suppression & Edit-Locks ----------
+  let suppressServerOverwriteUntil = 0; // Zeitstempel (ms) – bis dahin ignorieren wir Server->UI-Überschreiben
+  const suppress = (ms) => { suppressServerOverwriteUntil = Math.max(suppressServerOverwriteUntil, Date.now() + ms); };
+  const isSuppressed = () => Date.now() < suppressServerOverwriteUntil;
 
-  function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
-  function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
-  function setCountdownColorFromServer(col){
-    const el = $('#countMMSS'); const dot = $('#colorBadge').firstElementChild;
-    if(!col || col.length<3){ el.style.color=''; dot.style.background='#eaf2ff'; return; }
-    const hx = rgb2hex(col[0], col[1], col[2]); el.style.color=hx; dot.style.background=hx;
+  const editLocks = new Set(); // Feld-IDs, die lokal in Bearbeitung sind
+  const lockOn  = (id) => editLocks.add(id);
+  const lockOff = (id) => editLocks.delete(id);
+  const isLocked = (id) => editLocks.has(id);
+
+  // ---------- UI State ----------
+  let secondsRemaining = 0;
+  let timeSynced = false;
+  let mode = 'countdown';
+  let standby = false;
+
+  // ---------- UI Updaters ----------
+  function setPowerBtn(on) {
+    $('#powerBtn').dataset.state = on ? 'on' : 'off';
+    $('#powerBtn').textContent = 'LED: ' + (on ? 'an' : 'aus');
+  }
+  function setStandbyState(on) {
+    standby = !!on;
+    $('#standbyBtn').textContent = 'Standby: ' + (standby ? 'an' : 'aus');
+    $('#standbyBadge').textContent = 'Standby: ' + (standby ? 'an' : 'aus');
+  }
+  function setCountdownColorFromServer(col) {
+    if (!col || col.length < 3) return;
+    // keine Überschreibung, wenn Farben aktuell editiert werden
+    if (isLocked('cLow') || isLocked('cMid') || isLocked('cHigh')) return;
+    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
+  }
+  function setBadgeWlan(ip, rssi) {
+    $('#ip').textContent = ip || '-';
+    $('#rssi').textContent = (rssi !== undefined && rssi !== null) ? rssi + ' dBm' : '-';
+    $('#wlstate').textContent = 'WLAN: ' + (ip ? 'verbunden' : 'getrennt');
+    $('#wlstate').style.borderColor = ip ? 'rgba(122,217,107,.6)' : '#7d262c';
+  }
+  function setBadgeTimeSync(synced) {
+    timeSynced = !!synced;
+    $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
+    $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
+  }
+  function applyServerThresholds(th) {
+    if (!th) return;
+    if (!isLocked('tLow') && th.low !== undefined) $('#tLow').value = th.low;
+    if (!isLocked('tMid') && th.mid !== undefined) $('#tMid').value = th.mid;
+  }
+  function applyServerColors(cs) {
+    if (!cs) return;
+    if (!isLocked('cLow')  && cs.low)  $('#cLow').value  = rgb2hex(cs.low[0],  cs.low[1],  cs.low[2]);
+    if (!isLocked('cMid')  && cs.mid)  $('#cMid').value  = rgb2hex(cs.mid[0],  cs.mid[1],  cs.mid[2]);
+    if (!isLocked('cHigh') && cs.high) $('#cHigh').value = rgb2hex(cs.high[0], cs.high[1], cs.high[2]);
   }
 
-  // Setup speichern
-  $('#saveBtn').addEventListener('click', async ()=>{
-    const ssid=$('#ssid').value.trim(), password=$('#pwd').value, rbl=$('#rbl').value.trim(), apiKey=$('#apikey').value.trim();
-    if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
-    try{
-      const res = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password,rbl,apiKey})});
-      if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(), 2500); } else { toast('Fehler beim Speichern ('+res.status+')', false); }
-    }catch(e){ toast('Netzwerkfehler: '+e, false); }
-  });
-  $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
-
-  // LED Controls
-  async function postLed(payload){
-    try{
-      const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-      if(!r.ok) throw new Error(r.status);
-      suppressServerOverwriteUntil = Date.now()+2000; // 2s Ruhe nach Save
-      toast('LED-Settings übernommen');
-    }catch(e){ toast('Fehler: '+e, false); }
-  }
-  $('#powerBtn').addEventListener('click', ()=>{
-    const on = $('#powerBtn').dataset.state!=='off';
-    postLed({
-      power: !on,
-      brightness: +$('#brightRange').value,
-      thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
-    });
-  });
-  $('#standbyBtn').addEventListener('click', async ()=>{
-    try{
-      const r = await fetch('/api/standby',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({standby: !standby})});
-      if(!r.ok) throw new Error(r.status);
-      const j = await r.json(); setStandbyBtn(!!j.standby);
-      toast('Standby '+(j.standby?'aktiviert':'deaktiviert'));
-    }catch(e){ toast('Fehler: '+e, false); }
-  });
-
-  // Helligkeit
-  $('#brightRange').addEventListener('focus', ()=>lockOn('bright'));
-  $('#brightRange').addEventListener('blur',  ()=>lockOff('bright'));
-  $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent=e.target.value);
-  $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
-
-  // Threshold-Felder Lock
-  ['tLow','tMid'].forEach(id=>{
-    $('#'+id).addEventListener('focus', ()=>lockOn(id));
-    $('#'+id).addEventListener('blur',  ()=>lockOff(id));
-  });
-
-  // Color inputs: Lock + live preview + Save-Button
-  ['cLow','cMid','cHigh'].forEach(id=>{
-    $('#'+id).addEventListener('focus', ()=>lockOn(id));
-    $('#'+id).addEventListener('blur',  ()=>{ lockOff(id); updateAllPreviews(); });
-    $('#'+id).addEventListener('input', updateAllPreviews);
-  });
-
-  $('#ledSave').addEventListener('click', ()=>{
-    postLed({
-      power: $('#powerBtn').dataset.state!=='off',
-      brightness: +$('#brightRange').value,
-      thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
-    });
-  });
-
-  // Status holen & UI updaten (respektiert Locks)
-  async function refreshStatus(){
-    // Während aktiver Eingabe oder direkt nach Save nicht überschreiben
-    if (Date.now() < suppressServerOverwriteUntil) return;
-    try{
-      const r = await fetch('/api/status',{cache:'no-store'});
-      if(!r.ok) throw new Error(r.status);
+  // ---------- Server Sync ----------
+  async function refreshStatus() {
+    // Während Suppression keine UI-Überschreibung
+    if (isSuppressed()) return;
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) throw new Error(r.status);
       const s = await r.json();
 
       // WLAN / Zeit
-      $('#ip').textContent = s.ip || '-';
-      $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
-      $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
-      $('#wlstate').style.borderColor = s.ip ? 'rgba(122,217,107,.6)' : '#7d262c';
-      timeSynced = !!s.timeSynced;
-      $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
-      $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
-
-      // Countdown / Modus / Standby
+      setBadgeWlan(s.ip, s.rssi);
+      setBadgeTimeSync(!!s.timeSynced);
       mode = s.mode || 'countdown';
       $('#modeBadge').textContent = 'Modus: ' + mode;
-      secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
-      setStandbyBtn(!!s.standby);
+
+      // Countdown & Standby
+      if (!standby) secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
+      setStandbyState(!!s.standby);
+
+      // LED-Settings
       setPowerBtn(!!s.ledPower);
-
-      // LED-Settings, nur wenn Feld nicht editiert wird
-      setIfIdle('bright', ()=>{ $('#brightRange').value = s.brightness ?? 40; $('#brightVal').textContent = $('#brightRange').value; });
-      if (s.thresholds){
-        setIfIdle('tLow', ()=> $('#tLow').value = s.thresholds.low ?? 30);
-        setIfIdle('tMid', ()=> $('#tMid').value = s.thresholds.mid ?? 90);
-      }
-      if (s.colors){
-        const cL=s.colors.low, cM=s.colors.mid, cH=s.colors.high;
-        setIfIdle('cLow',  ()=>{ if(cL) $('#cLow').value  = rgb2hex(cL[0],cL[1],cL[2]); });
-        setIfIdle('cMid',  ()=>{ if(cM) $('#cMid').value  = rgb2hex(cM[0],cM[1],cM[2]); });
-        setIfIdle('cHigh', ()=>{ if(cH) $('#cHigh').value = rgb2hex(cH[0],cH[1],cH[2]); });
-        updateAllPreviews();
+      if (!isLocked('brightRange') && s.brightness !== undefined) {
+        $('#brightRange').value = s.brightness;
+        $('#brightVal').textContent = s.brightness;
       }
 
-      // JSON-Log
-      try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
+      // Farben/Schwellwerte aus Server übernehmen (wenn nicht gelockt/suppress)
+      applyServerThresholds(s.thresholds);
+      applyServerColors(s.colors);
 
-      syncCountdown = timeSynced ? 5 : 1;
-      setCountdownColorFromServer(s.currentColor);
-    }catch(e){ /* AP-Modus ok */ }
+      // Farbe des Countdowns (nur wenn kein Farb-Edit aktiv)
+      if (!isLocked('cLow') && !isLocked('cMid') && !isLocked('cHigh')) {
+        setCountdownColorFromServer(s.currentColor);
+      }
+
+      // JSON-Log (nicht kritisch, daher separat ohne Strict)
+      try {
+        const l = await fetch('/api/last-payload', { cache: 'no-store' });
+        if (l.ok) $('#log').value = await l.text();
+      } catch (_) {}
+
+    } catch (e) {
+      // AP-Modus o.ä. – kein Toast-Spam
+    }
   }
 
-  // Sekundentick
-  setInterval(()=>{
-    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
-    if(secondsRemaining>0) secondsRemaining--;
+  // ---------- POST Helpers ----------
+  async function postLed(payload, msgOk = 'LED-Settings übernommen') {
+    try {
+      const r = await fetch('/api/led', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) throw new Error(r.status);
+      toast(msgOk);
+      suppress(1200); // kurze Ruhe, damit Rück-Sync nicht "flackert"
+    } catch (e) {
+      toast('Fehler: ' + e, false);
+    }
+  }
+
+  // ---------- Event Wiring ----------
+  // Setup speichern
+  $('#saveBtn').addEventListener('click', async () => {
+    const ssid   = $('#ssid').value.trim();
+    const password = $('#pwd').value;
+    const rbl    = $('#rbl').value.trim();
+    const apiKey = $('#apikey').value.trim();
+    if (!ssid || !rbl || !apiKey) {
+      toast('Bitte SSID, RBL und API-Key ausfüllen', false);
+      return;
+    }
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ ssid, password, rbl, apiKey })
+      });
+      if (res.ok) {
+        toast('Gespeichert. Neustart…');
+        suppress(4000);
+        setTimeout(() => location.reload(), 3000);
+      } else {
+        toast('Fehler beim Speichern (' + res.status + ')', false);
+      }
+    } catch (e) {
+      toast('Netzwerkfehler: ' + e, false);
+    }
+  });
+  $('#statusBtn').addEventListener('click', () => location.href = '/api/status');
+
+  // Power
+  $('#powerBtn').addEventListener('click', () => {
+    const on = $('#powerBtn').dataset.state !== 'off';
+    postLed({
+      power: !on,
+      brightness: +$('#brightRange').value,
+      thresholds: { low: +$('#tLow').value || 0, mid: +$('#tMid').value || 0 },
+      colors: {
+        low:  hex2rgb($('#cLow').value),
+        mid:  hex2rgb($('#cMid').value),
+        high: hex2rgb($('#cHigh').value)
+      }
+    }, 'LED ' + (!on ? 'ein' : 'aus'));
+  });
+
+  // Standby
+  $('#standbyBtn').addEventListener('click', async () => {
+    try {
+      const r = await fetch('/api/standby', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ standby: !standby })
+      });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      setStandbyState(!!j.standby);
+      toast('Standby ' + (j.standby ? 'aktiviert' : 'deaktiviert'));
+      suppress(1500);
+    } catch (e) { toast('Fehler: ' + e, false); }
+  });
+
+  // Brightness + Thresholds – Locks & Suppression
+  [['brightRange', 10000], ['tLow', 10000], ['tMid', 10000]].forEach(([id, ms]) => {
+    const el = $('#' + id);
+    el.addEventListener('focus', () => lockOn(id));
+    el.addEventListener('input', () => {
+      if (id === 'brightRange') $('#brightVal').textContent = el.value;
+      suppress(ms);
+    });
+    el.addEventListener('change', () => suppress(ms));
+    el.addEventListener('blur',  () => { lockOff(id); suppress(3000); });
+  });
+
+  // Color Inputs – Locks & Suppression + Live-Farbanzeige
+  function updateCountdownPreview() {
+    // nur optische Vorschau für Countdown-Farbe: Priorität High > Mid > Low anhand Sekunden
+    const low  = hex2rgb($('#cLow').value);
+    const mid  = hex2rgb($('#cMid').value);
+    const high = hex2rgb($('#cHigh').value);
+    const tLow = +$('#tLow').value || 30;
+    const tMid = +$('#tMid').value || 90;
+    let col = high;
+    if (secondsRemaining < Math.min(tLow, tMid)) col = low;
+    else if (secondsRemaining < Math.max(tLow, tMid)) col = mid;
+    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
+  }
+  ['cLow','cMid','cHigh'].forEach(id => {
+    const el = $('#' + id);
+    el.addEventListener('focus', () => { lockOn(id); suppress(15000); });
+    el.addEventListener('input', () => { updateCountdownPreview(); suppress(15000); });
+    el.addEventListener('change', () => { updateCountdownPreview(); suppress(15000); });
+    el.addEventListener('blur',  () => { lockOff(id); updateCountdownPreview(); suppress(5000); });
+  });
+
+  // „Speichern“ für LED-Settings
+  $('#ledSave').addEventListener('click', () => {
+    const payload = {
+      power: $('#powerBtn').dataset.state !== 'off',
+      brightness: +$('#brightRange').value,
+      thresholds: {
+        low: +$('#tLow').value || 0,
+        mid: +$('#tMid').value || 0
+      },
+      colors: {
+        low:  hex2rgb($('#cLow').value),
+        mid:  hex2rgb($('#cMid').value),
+        high: hex2rgb($('#cHigh').value)
+      }
+    };
+    postLed(payload, 'LED-Einstellungen gespeichert');
+    // kleine Nachlauf-Suppression, damit der nachfolgende Status-Pull nicht sofort "hart" überschreibt
+    suppress(2000);
+  });
+
+  // ---------- Client-Timer ----------
+  // Sekundentick (nur Anzeige)
+  setInterval(() => {
+    if (mode === 'off' || !timeSynced || standby) { $('#countMMSS').textContent = '--:--'; return; }
+    if (secondsRemaining > 0) secondsRemaining--;
     $('#countMMSS').textContent = fmt(secondsRemaining);
-    if(syncCountdown>0) syncCountdown--;
-    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
   }, 1000);
 
-  // Status polling
+  // Status polling (respektiert Suppression in refreshStatus)
   setInterval(refreshStatus, 1000);
   refreshStatus();
-  updateAllPreviews();
 })();
 </script>
-
 </body>
 </html>
 )HTML";
