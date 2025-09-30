@@ -2,12 +2,12 @@
   Wiener Linien Countdown + NeoPixel 7-Segment mit REST-API
   - Mobil-optimierte Setup-/Status-Seite auf /
     * Formular (SSID/Passwort/RBL/API-Key)
-    * Live-Countdown (MM:SS) – ident zur 7-Segment Anzeige
+    * Live-Countdown (MM:SS), farbig wie LEDs
     * Logfenster mit letzter WL-JSON-Antwort
     * LED-Steuerung: Power, Brightness, 3 Farben + 2 Schwellwerte
     * Standby-Button (LEDs AUS + Polling pausiert)
   - Countdown-Berechnung NUR: time(dep) - time(now) (niemals API 'countdown')
-  - Robust: ArduinoJson-Filter + String-Fallback mit korrekter TZ (+hhmm/Z)
+  - Robust: stromorientierte JSON-Suche über alle timeReal/Planned (keine TooDeep)
   - NTP-Racefix (timeSynced): es wird erst nach Zeit-Sync gerechnet
   - Serial-Logs inkl. Sekunden & MM:SS
   - HTTPS: Fingerprint optional; sonst setInsecure()
@@ -74,7 +74,7 @@ unsigned long nextTickAt = 0;
 unsigned long backoffMs = 20000;
 
 bool timeSynced = false;
-bool standby = false;               // <<<< Standby-Flag
+bool standby = false;               // Standby: LEDs aus & Polling pausiert
 const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
 
 // ---------- 7-Segment Mapping ----------
@@ -207,13 +207,14 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   let colors = { low:[255,0,0], mid:[255,180,0], high:[0,255,0] };
   let standby = false;
 
-  // Farbe vom Gerät (server-truth) übernehmen
+  function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
+  function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
   function setCountdownColorFromServer(col){
     if(!col || col.length<3){ $('#countMMSS').style.color=''; return; }
     $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
   }
 
-  // ---- Setup-Form speichern ----
+  // Setup speichern
   $('#saveBtn').addEventListener('click', async ()=>{
     const ssid=$('#ssid').value.trim(), password=$('#pwd').value, rbl=$('#rbl').value.trim(), apiKey=$('#apikey').value.trim();
     if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
@@ -224,7 +225,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   });
   $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
 
-  // ---- LED-Controls ----
+  // LED Controls
   async function postLed(payload){
     try{
       const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -232,9 +233,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       toast('LED-Settings übernommen');
     }catch(e){ toast('Fehler: '+e, false); }
   }
-  function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
-  function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
-
   $('#powerBtn').addEventListener('click', ()=>{
     const on = $('#powerBtn').dataset.state!=='off';
     postLed({
@@ -244,7 +242,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
     });
   });
-
   $('#standbyBtn').addEventListener('click', async ()=>{
     try{
       const r = await fetch('/api/standby',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({standby: !standby})});
@@ -257,6 +254,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
   $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
 
+  // Farben/Schwellen sofortige Vorschau (Serverfarbe bleibt maßgeblich)
+  const previewHooks = ['tLow','tMid','cLow','cMid','cHigh'];
+  previewHooks.forEach(id=>{
+    $('#'+id).addEventListener('input', ()=>{
+      thresholds.low = +$('#tLow').value || thresholds.low;
+      thresholds.mid = +$('#tMid').value || thresholds.mid;
+      colors.low  = hex2rgb($('#cLow').value);
+      colors.mid  = hex2rgb($('#cMid').value);
+      colors.high = hex2rgb($('#cHigh').value);
+    });
+  });
+
   $('#ledSave').addEventListener('click', ()=>{
     postLed({
       power: $('#powerBtn').dataset.state!=='off',
@@ -266,7 +275,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     });
   });
 
-  // ---- Status holen & UI updaten ----
+  // Status holen & UI updaten
   async function refreshStatus(){
     try{
       const r = await fetch('/api/status',{cache:'no-store'});
@@ -288,24 +297,19 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
       setStandbyBtn(!!s.standby);
 
-      // LED-Settings in UI spiegeln
+      // LED-Settings
       setPowerBtn(!!s.ledPower);
       $('#brightRange').value = s.brightness ?? 40;
       $('#brightVal').textContent = $('#brightRange').value;
 
       if (s.thresholds){
-        thresholds.low = +s.thresholds.low ?? thresholds.low;
-        thresholds.mid = +s.thresholds.mid ?? thresholds.mid;
-        $('#tLow').value = thresholds.low;
-        $('#tMid').value = thresholds.mid;
+        $('#tLow').value = s.thresholds.low ?? 30;
+        $('#tMid').value = s.thresholds.mid ?? 90;
       }
       if (s.colors){
-        colors.low  = s.colors.low  || colors.low;
-        colors.mid  = s.colors.mid  || colors.mid;
-        colors.high = s.colors.high || colors.high;
-        if (s.colors.low)  $('#cLow').value  = rgb2hex(colors.low[0],  colors.low[1],  colors.low[2]);
-        if (s.colors.mid)  $('#cMid').value  = rgb2hex(colors.mid[0],  colors.mid[1],  colors.mid[2]);
-        if (s.colors.high) $('#cHigh').value = rgb2hex(colors.high[0], colors.high[1], colors.high[2]);
+        if (s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
+        if (s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
+        if (s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
       }
 
       // JSON-Log
@@ -469,7 +473,7 @@ bool ensureTime() {
   return timeSynced;
 }
 
-// ---------- WL-Fetch ----------
+// ---------- WL-Fetch (stromorientiert & robust) ----------
 int fetchBusCountdown(){
   if (standby) return -1;         // Standby: kein Polling
   ensureWifi();
@@ -499,7 +503,7 @@ int fetchBusCountdown(){
 
   logLine("HTTP Code: "+String(code));
   if(payload.length()>0){
-    if(payload.length()>16384) payload.remove(16384); // limit
+    if(payload.length()>16384) payload.remove(16384); // limitieren
     lastPayload = payload;
     size_t cutlen = payload.length()<1200? payload.length(): 1200;
     logLine("["+String(tbuf)+"] API Payload (cut):");
@@ -507,55 +511,41 @@ int fetchBusCountdown(){
   }
   if(code!=HTTP_CODE_OK) return -1;
 
-  // ---- JSON-Filter (ohne countdown) ----
-  {
-    StaticJsonDocument<512> filter;
-    filter["data"]["monitors"][0]["lines"][0]["departures"]["departure"][0]["departureTime"]["timeReal"] = true;
-    filter["data"]["monitors"][0]["lines"][0]["departures"]["departure"][0]["departureTime"]["timePlanned"] = true;
-
-    DynamicJsonDocument doc(6144);
-    DeserializationError jerr = deserializeJson(doc, lastPayload, DeserializationOption::Filter(filter));
-    if(!jerr){
-      JsonVariant dt = doc["data"]["monitors"][0]["lines"][0]["departures"]["departure"][0]["departureTime"];
-      if(!dt.isNull()){
-        const char *tsReal = dt["timeReal"] | nullptr;
-        const char *tsPlan = dt["timePlanned"] | nullptr;
-        const char *ts = tsReal ? tsReal : tsPlan;
-        if(ts){
-          time_t tDep = parseISO8601_UTC_to_epoch(String(ts));
-          time_t now2 = time(nullptr);
-          long diff = (long)tDep - (long)now2; if(diff<0) diff=0;
-          secondsToBus = (int)diff; lastUpdateMs = millis();
-
-          int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-          logLine(String("--- Countdown (parsed JSON): ")+String(secondsToBus)+" sec ("+mmss+") ---");
-          return secondsToBus;
-        }
-      }
-    } else {
-      logLine(String("JSON parse error: ")+jerr.c_str());
+  // ---- Stromorientierte Suche: früheste zukünftige timeReal, sonst timePlanned ----
+  auto scanNext = [&](const char* key)->int {
+    int best = -1;
+    int pos = 0;
+    const String needle = String("\"") + key + "\":\"";  // z.B. "timeReal":"
+    while (true) {
+      int k = payload.indexOf(needle, pos);
+      if (k < 0) break;
+      int sidx = k + needle.length();
+      int eidx = payload.indexOf('"', sidx);
+      if (eidx < 0) break;
+      String iso = payload.substring(sidx, eidx);
+      time_t tDep = parseISO8601_UTC_to_epoch(iso);
+      long diff = (long)tDep - (long)time(nullptr);
+      if (diff >= 0 && (best < 0 || diff < best)) best = (int)diff;
+      pos = eidx + 1;
+      if (pos > 16000) break; // Sicherheitsbremse
     }
+    return best;
+  };
+
+  int diff = scanNext("timeReal");
+  if (diff < 0) diff = scanNext("timePlanned");  // Fallback
+
+  if (diff < 0) {
+    logLine("Kein gültiger Zeitpunkt im JSON gefunden.");
+    return -1;
   }
 
-  // ---- Fallback: Stringsuche ----
-  String iso="";
-  int kReal = lastPayload.indexOf("\"timeReal\":\"");
-  int kPlan = lastPayload.indexOf("\"timePlanned\":\"");
-  if (kReal > 0) { if(!extractIsoAfter(lastPayload, kReal+12, iso)) iso=""; }
-  if (iso.length()==0 && kPlan > 0) { extractIsoAfter(lastPayload, kPlan+15, iso); }
+  secondsToBus = diff;
+  lastUpdateMs = millis();
 
-  if (iso.length() > 0) {
-    time_t tDep = parseISO8601_UTC_to_epoch(iso);
-    time_t now3 = time(nullptr);
-    long diff = (long)tDep - (long)now3; if (diff < 0) diff = 0;
-    secondsToBus = (int)diff; lastUpdateMs = millis();
-
-    int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-    logLine(String("--- Countdown (fallback string): ")+String(secondsToBus)+" sec ("+mmss+") ---");
-    return secondsToBus;
-  }
-
-  return -1;
+  int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
+  logLine(String("--- Countdown (stream-scan): ")+String(secondsToBus)+" sec ("+mmss+") ---");
+  return secondsToBus;
 }
 
 // ---------- Anzeige-States ----------
@@ -591,7 +581,7 @@ void handleStatus(){
   doc["ledPower"] = cfg.ledPower;
   doc["brightness"] = cfg.brightness;
 
-  // Farblogik ident zum Gerät – als currentColor mitliefern
+  // currentColor wie am Gerät berechnen
   uint8_t rr=255,gg=255,bb=255;
   pickColorForSeconds(secondsToBus, rr,gg,bb);
   JsonArray curr = doc["currentColor"].to<JsonArray>(); curr.add(rr); curr.add(gg); curr.add(bb);
@@ -681,7 +671,7 @@ void handleDisplayPost(){
   saveConfig(); applyLedState(); server.send(200,"application/json","{\"ok\":true}");
 }
 
-// ---- NEU: Standby-Endpoint ----
+// Standby-Endpoint
 void handleStandbyPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
   StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
@@ -772,8 +762,14 @@ void loop(){
   // Poll WL
   if(!standby && millis() >= nextPollAt){
     int s = fetchBusCountdown();
-    if(s>=0){ secondsToBus=s; backoffMs=20000; }
-    else { backoffMs = backoffMs*2; if(backoffMs>300000UL) backoffMs=300000UL; }
+    if(s>=0){
+      secondsToBus=s;
+      // sehr schnelles Re-Polling, wenn Abfahrt quasi jetzt ist
+      if (secondsToBus <= 3) backoffMs = 3000;   // 3s
+      else                   backoffMs = 20000;  // 20s
+    } else {
+      backoffMs = backoffMs*2; if(backoffMs>300000UL) backoffMs=300000UL; // bis 5 min
+    }
     nextPollAt = millis() + (timeSynced ? backoffMs : 2000);
 
     int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
