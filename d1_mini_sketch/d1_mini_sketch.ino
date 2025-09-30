@@ -273,20 +273,35 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   const rgb2hex = (r,g,b) => '#'+[r,g,b].map(v=>('0'+v.toString(16)).slice(-2)).join('');
   const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
 
+  // --- Edit-Locks: verhindern Überschreiben während Eingabe ---
+  const editing = {
+    cLow:false, cMid:false, cHigh:false,
+    tLow:false, tMid:false,
+    bright:false
+  };
+  const lockOn = id => editing[id]=true;
+  const lockOff = id => editing[id]=false;
+  const setIfIdle = (id, setter) => { if(!editing[id]) setter(); };
+
   // --- Color preview helpers ---
   const setPreview = (el, hex) => { el.style.setProperty('--bar', hex); };
-  const updateAllPreviews = () => { setPreview($('#pLow'), $('#cLow').value); setPreview($('#pMid'), $('#cMid').value); setPreview($('#pHigh'), $('#cHigh').value); };
+  const updateAllPreviews = () => {
+    setPreview($('#pLow'),  $('#cLow').value);
+    setPreview($('#pMid'),  $('#cMid').value);
+    setPreview($('#pHigh'), $('#cHigh').value);
+  };
 
   // ---- State ----
   let secondsRemaining = 0, mode='countdown', syncCountdown=0, timeSynced=false;
   let standby=false;
+  let suppressServerOverwriteUntil = 0; // ms
 
   function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
   function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
   function setCountdownColorFromServer(col){
-    const el = $('#countMMSS'); const badge = $('#colorBadge').firstElementChild;
-    if(!col || col.length<3){ el.style.color=''; badge.style.background='#eaf2ff'; return; }
-    const hx = rgb2hex(col[0], col[1], col[2]); el.style.color=hx; badge.style.background=hx;
+    const el = $('#countMMSS'); const dot = $('#colorBadge').firstElementChild;
+    if(!col || col.length<3){ el.style.color=''; dot.style.background='#eaf2ff'; return; }
+    const hx = rgb2hex(col[0], col[1], col[2]); el.style.color=hx; dot.style.background=hx;
   }
 
   // Setup speichern
@@ -305,6 +320,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     try{
       const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(!r.ok) throw new Error(r.status);
+      suppressServerOverwriteUntil = Date.now()+2000; // 2s Ruhe nach Save
       toast('LED-Settings übernommen');
     }catch(e){ toast('Fehler: '+e, false); }
   }
@@ -326,11 +342,25 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     }catch(e){ toast('Fehler: '+e, false); }
   });
 
+  // Helligkeit
+  $('#brightRange').addEventListener('focus', ()=>lockOn('bright'));
+  $('#brightRange').addEventListener('blur',  ()=>lockOff('bright'));
   $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent=e.target.value);
   $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
 
-  // Color inputs live preview + save
-  ['cLow','cMid','cHigh'].forEach(id=>{ $('#'+id).addEventListener('input', updateAllPreviews); });
+  // Threshold-Felder Lock
+  ['tLow','tMid'].forEach(id=>{
+    $('#'+id).addEventListener('focus', ()=>lockOn(id));
+    $('#'+id).addEventListener('blur',  ()=>lockOff(id));
+  });
+
+  // Color inputs: Lock + live preview + Save-Button
+  ['cLow','cMid','cHigh'].forEach(id=>{
+    $('#'+id).addEventListener('focus', ()=>lockOn(id));
+    $('#'+id).addEventListener('blur',  ()=>{ lockOff(id); updateAllPreviews(); });
+    $('#'+id).addEventListener('input', updateAllPreviews);
+  });
+
   $('#ledSave').addEventListener('click', ()=>{
     postLed({
       power: $('#powerBtn').dataset.state!=='off',
@@ -340,8 +370,10 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     });
   });
 
-  // Status holen & UI updaten
+  // Status holen & UI updaten (respektiert Locks)
   async function refreshStatus(){
+    // Während aktiver Eingabe oder direkt nach Save nicht überschreiben
+    if (Date.now() < suppressServerOverwriteUntil) return;
     try{
       const r = await fetch('/api/status',{cache:'no-store'});
       if(!r.ok) throw new Error(r.status);
@@ -363,19 +395,17 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       setStandbyBtn(!!s.standby);
       setPowerBtn(!!s.ledPower);
 
-      // LED-Settings
-      $('#brightRange').value = s.brightness ?? 40;
-      $('#brightVal').textContent = $('#brightRange').value;
-
+      // LED-Settings, nur wenn Feld nicht editiert wird
+      setIfIdle('bright', ()=>{ $('#brightRange').value = s.brightness ?? 40; $('#brightVal').textContent = $('#brightRange').value; });
       if (s.thresholds){
-        $('#tLow').value = s.thresholds.low ?? 30;
-        $('#tMid').value = s.thresholds.mid ?? 90;
+        setIfIdle('tLow', ()=> $('#tLow').value = s.thresholds.low ?? 30);
+        setIfIdle('tMid', ()=> $('#tMid').value = s.thresholds.mid ?? 90);
       }
       if (s.colors){
         const cL=s.colors.low, cM=s.colors.mid, cH=s.colors.high;
-        if (cL) $('#cLow').value = rgb2hex(cL[0],cL[1],cL[2]);
-        if (cM) $('#cMid').value = rgb2hex(cM[0],cM[1],cM[2]);
-        if (cH) $('#cHigh').value= rgb2hex(cH[0],cH[1],cH[2]);
+        setIfIdle('cLow',  ()=>{ if(cL) $('#cLow').value  = rgb2hex(cL[0],cL[1],cL[2]); });
+        setIfIdle('cMid',  ()=>{ if(cM) $('#cMid').value  = rgb2hex(cM[0],cM[1],cM[2]); });
+        setIfIdle('cHigh', ()=>{ if(cH) $('#cHigh').value = rgb2hex(cH[0],cH[1],cH[2]); });
         updateAllPreviews();
       }
 
@@ -402,6 +432,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   updateAllPreviews();
 })();
 </script>
+
 </body>
 </html>
 )HTML";
