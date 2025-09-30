@@ -5,6 +5,7 @@
     * Live-Countdown (MM:SS) – ident zur 7-Segment Anzeige
     * Logfenster mit letzter WL-JSON-Antwort
     * LED-Steuerung: Power, Brightness, 3 Farben + 2 Schwellwerte
+    * Standby-Button (LEDs AUS + Polling pausiert)
   - Countdown-Berechnung NUR: time(dep) - time(now) (niemals API 'countdown')
   - Robust: ArduinoJson-Filter + String-Fallback mit korrekter TZ (+hhmm/Z)
   - NTP-Racefix (timeSynced): es wird erst nach Zeit-Sync gerechnet
@@ -73,6 +74,7 @@ unsigned long nextTickAt = 0;
 unsigned long backoffMs = 20000;
 
 bool timeSynced = false;
+bool standby = false;               // <<<< Standby-Flag
 const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
 
 // ---------- 7-Segment Mapping ----------
@@ -110,6 +112,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 .btn{display:inline-flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#2a67ff,#154eff);color:#fff;border:none;
      padding:12px 16px;border-radius:12px;font-weight:600;cursor:pointer}
 .btn.secondary{background:linear-gradient(180deg,#2b3548,#1d2535);border:1px solid #2a3648}
+.btn.warn{background:linear-gradient(180deg,#6f6b2a,#5a501b)}
 .kv{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:13px}
 .kv b{color:var(--ink)} .count{font-weight:800;font-size:clamp(36px,12vw,64px);letter-spacing:.04em}
 .badge{display:inline-block;border-radius:999px;padding:6px 10px;font-size:12px;border:1px solid #2a3648;color:var(--dim)}
@@ -143,10 +146,11 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   <div class="card">
     <h1>Live-Anzeige</h1>
     <p class="lead">Dieser Countdown spiegelt die 7-Segment Anzeige (MM:SS).</p>
-    <div class="count" id="countMMSS">--:--</div>
+    <div class="count" id="countMMSS" style="color:#eaf2ff">--:--</div>
     <div class="flex">
       <span class="badge" id="modeBadge">Modus: countdown</span>
       <span class="badge" id="nextSync">Sync in: -</span>
+      <span class="badge" id="standbyBadge">Standby: aus</span>
     </div>
     <div class="row" style="margin-top:12px">
       <label for="log">Letzte WL-JSON-Antwort</label>
@@ -157,8 +161,9 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   <div class="card" style="grid-column:1 / -1">
     <h1>LED & Farben</h1>
     <p class="lead">Leistung und Farben abhängig von der verbleibenden Zeit.</p>
-    <div class="flex" style="align-items:center">
+    <div class="flex" style="align-items:center;flex-wrap:wrap">
       <button class="btn" id="powerBtn">LED: an</button>
+      <button class="btn warn" id="standbyBtn">Standby: aus</button>
       <div class="pill">Helligkeit: <b id="brightVal">0</b></div>
     </div>
     <input id="brightRange" type="range" min="0" max="255" step="1" value="40" />
@@ -194,8 +199,21 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   const toast = (m, ok=true) => { const t=$('#toast'); t.textContent=m; t.className='toast'+(ok?'':' err'); t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); };
   const hex2rgb = h => { const x=h.replace('#',''); return [parseInt(x.slice(0,2),16),parseInt(x.slice(2,4),16),parseInt(x.slice(4,6),16)]; };
   const rgb2hex = (r,g,b) => '#'+[r,g,b].map(v=>('0'+v.toString(16)).slice(-2)).join('');
+  const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
 
-  // Formular speichern
+  // ---- State ----
+  let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
+  let thresholds = {low:30, mid:90};
+  let colors = { low:[255,0,0], mid:[255,180,0], high:[0,255,0] };
+  let standby = false;
+
+  // Farbe vom Gerät (server-truth) übernehmen
+  function setCountdownColorFromServer(col){
+    if(!col || col.length<3){ $('#countMMSS').style.color=''; return; }
+    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
+  }
+
+  // ---- Setup-Form speichern ----
   $('#saveBtn').addEventListener('click', async ()=>{
     const ssid=$('#ssid').value.trim(), password=$('#pwd').value, rbl=$('#rbl').value.trim(), apiKey=$('#apikey').value.trim();
     if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
@@ -206,7 +224,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   });
   $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
 
-  // LED Controls
+  // ---- LED-Controls ----
   async function postLed(payload){
     try{
       const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -214,13 +232,26 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       toast('LED-Settings übernommen');
     }catch(e){ toast('Fehler: '+e, false); }
   }
+  function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
+  function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
 
   $('#powerBtn').addEventListener('click', ()=>{
     const on = $('#powerBtn').dataset.state!=='off';
-    postLed({power: !on, brightness: +$('#brightRange').value,
+    postLed({
+      power: !on,
+      brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
       colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
     });
+  });
+
+  $('#standbyBtn').addEventListener('click', async ()=>{
+    try{
+      const r = await fetch('/api/standby',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({standby: !standby})});
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json(); setStandbyBtn(!!j.standby);
+      toast('Standby '+(j.standby?'aktiviert':'deaktiviert'));
+    }catch(e){ toast('Fehler: '+e, false); }
   });
 
   $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
@@ -235,67 +266,68 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     });
   });
 
-  // Countdown & Status
-  let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
-
-  const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
-
-  function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
-
+  // ---- Status holen & UI updaten ----
   async function refreshStatus(){
     try{
       const r = await fetch('/api/status',{cache:'no-store'});
       if(!r.ok) throw new Error(r.status);
       const s = await r.json();
 
+      // WLAN / Zeit
       $('#ip').textContent = s.ip || '-';
       $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
       $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
       $('#wlstate').style.borderColor = s.ip ? 'rgba(122,217,107,.6)' : '#7d262c';
-
       timeSynced = !!s.timeSynced;
       $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
       $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
 
-      if (timeSynced) {
-        secondsRemaining = s.secondsToBus || 0;
-        mode = s.mode || 'countdown';
-        $('#modeBadge').textContent = 'Modus: ' + mode;
-      } else {
-        secondsRemaining = 0;
-        $('#countMMSS').textContent = '--:--';
-      }
+      // Countdown / Modus / Standby
+      mode = s.mode || 'countdown';
+      $('#modeBadge').textContent = 'Modus: ' + mode;
+      secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
+      setStandbyBtn(!!s.standby);
 
-      // LED Settings in UI spiegeln
+      // LED-Settings in UI spiegeln
       setPowerBtn(!!s.ledPower);
       $('#brightRange').value = s.brightness ?? 40;
       $('#brightVal').textContent = $('#brightRange').value;
 
       if (s.thresholds){
-        $('#tLow').value = s.thresholds.low ?? 30;
-        $('#tMid').value = s.thresholds.mid ?? 90;
+        thresholds.low = +s.thresholds.low ?? thresholds.low;
+        thresholds.mid = +s.thresholds.mid ?? thresholds.mid;
+        $('#tLow').value = thresholds.low;
+        $('#tMid').value = thresholds.mid;
       }
       if (s.colors){
-        if (s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0], s.colors.low[1], s.colors.low[2]);
-        if (s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0], s.colors.mid[1], s.colors.mid[2]);
-        if (s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
+        colors.low  = s.colors.low  || colors.low;
+        colors.mid  = s.colors.mid  || colors.mid;
+        colors.high = s.colors.high || colors.high;
+        if (s.colors.low)  $('#cLow').value  = rgb2hex(colors.low[0],  colors.low[1],  colors.low[2]);
+        if (s.colors.mid)  $('#cMid').value  = rgb2hex(colors.mid[0],  colors.mid[1],  colors.mid[2]);
+        if (s.colors.high) $('#cHigh').value = rgb2hex(colors.high[0], colors.high[1], colors.high[2]);
       }
 
       // JSON-Log
       try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
 
       syncCountdown = timeSynced ? 5 : 1;
-    }catch(e){ /* im AP-Modus ok */ }
+
+      // Countdown-Farbe (vom Server geliefertes currentColor)
+      setCountdownColorFromServer(s.currentColor);
+    }catch(e){ /* AP-Modus ok */ }
   }
 
+  // Sekundentick
   setInterval(()=>{
-    if(mode==='off' || !timeSynced){ $('#countMMSS').textContent='--:--'; return; }
+    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
     if(secondsRemaining>0) secondsRemaining--;
     $('#countMMSS').textContent = fmt(secondsRemaining);
     if(syncCountdown>0) syncCountdown--;
     $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
   }, 1000);
 
+  // Status polling
   setInterval(refreshStatus, 1000);
   refreshStatus();
 })();
@@ -439,6 +471,7 @@ bool ensureTime() {
 
 // ---------- WL-Fetch ----------
 int fetchBusCountdown(){
+  if (standby) return -1;         // Standby: kein Polling
   ensureWifi();
   if (WiFi.status()!=WL_CONNECTED) return -1;
 
@@ -526,17 +559,18 @@ int fetchBusCountdown(){
 }
 
 // ---------- Anzeige-States ----------
-enum class DisplayMode : uint8_t { COUNTDOWN, OFF, MINUS };
+enum class DisplayMode : uint8_t { COUNTDOWN, OFF, MINUS, STANDBY };
 DisplayMode mode = DisplayMode::COUNTDOWN;
 
 void applyLedState(){
   strip.setBrightness(cfg.brightness);
-  if(!cfg.ledPower){ displayClear(); return; }
+  if(!cfg.ledPower || standby){ displayClear(); return; }
   uint8_t r,g,b; pickColorForSeconds(secondsToBus, r,g,b);
   switch(mode){
     case DisplayMode::COUNTDOWN: if(secondsToBus>0) displayDigitsMMSS(secondsToBus,r,g,b); else displayMinusBoth(r,g,b); break;
     case DisplayMode::OFF: displayClear(); break;
     case DisplayMode::MINUS: displayMinusBoth(r,g,b); break;
+    case DisplayMode::STANDBY: displayClear(); break;
   }
 }
 
@@ -544,24 +578,33 @@ void applyLedState(){
 void serveIndex(){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); }
 
 void handleStatus(){
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1200> doc;
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
-  doc["secondsToBus"] = timeSynced ? secondsToBus : 0;
+  doc["secondsToBus"] = (timeSynced && !standby) ? secondsToBus : 0;
   doc["lastUpdateMs"] = lastUpdateMs;
   doc["timeSynced"] = timeSynced;
   doc["now"] = (uint32_t) time(nullptr);
+  doc["standby"] = standby;
 
   doc["ledPower"] = cfg.ledPower;
   doc["brightness"] = cfg.brightness;
+
+  // Farblogik ident zum Gerät – als currentColor mitliefern
+  uint8_t rr=255,gg=255,bb=255;
+  pickColorForSeconds(secondsToBus, rr,gg,bb);
+  JsonArray curr = doc["currentColor"].to<JsonArray>(); curr.add(rr); curr.add(gg); curr.add(bb);
+
   JsonObject thresholds = doc["thresholds"].to<JsonObject>(); thresholds["low"]=cfg.tLow; thresholds["mid"]=cfg.tMid;
   JsonObject colors = doc["colors"].to<JsonObject>();
   JsonArray low = colors["low"].to<JsonArray>();   low.add(cfg.colLow[0]);   low.add(cfg.colLow[1]);   low.add(cfg.colLow[2]);
   JsonArray mid = colors["mid"].to<JsonArray>();   mid.add(cfg.colMid[0]);   mid.add(cfg.colMid[1]);   mid.add(cfg.colMid[2]);
   JsonArray high= colors["high"].to<JsonArray>(); high.add(cfg.colHigh[0]); high.add(cfg.colHigh[1]); high.add(cfg.colHigh[2]);
 
-  doc["mode"] = (mode==DisplayMode::COUNTDOWN ? "countdown" : mode==DisplayMode::OFF ? "off" : "minus");
+  doc["mode"] = (mode==DisplayMode::COUNTDOWN ? "countdown" :
+                (mode==DisplayMode::OFF ? "off" :
+                (mode==DisplayMode::MINUS ? "minus" : "standby")));
   doc["ssid"] = cfg.ssid; doc["apiKey"] = cfg.apiKey; doc["rbl"] = cfg.rbl;
   doc["httpsInsecure"] = cfg.httpsInsecure; doc["httpsFingerprint"] = cfg.httpsFingerprint;
   doc["loglen"] = ringLog.length();
@@ -628,9 +671,29 @@ void handleLedPost(){
 void handleDisplayPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
   StaticJsonDocument<512> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
-  if(doc["mode"].is<const char*>()){ String m=doc["mode"].as<const char*>(); if(m=="countdown") mode=DisplayMode::COUNTDOWN; else if(m=="off") mode=DisplayMode::OFF; else if(m=="minus") mode=DisplayMode::MINUS; }
+  if(doc["mode"].is<const char*>()){
+    String m=doc["mode"].as<const char*>();
+    if(m=="countdown") mode=DisplayMode::COUNTDOWN;
+    else if(m=="off") mode=DisplayMode::OFF;
+    else if(m=="minus") mode=DisplayMode::MINUS;
+    else if(m=="standby") { standby=true; mode=DisplayMode::STANDBY; }
+  }
   saveConfig(); applyLedState(); server.send(200,"application/json","{\"ok\":true}");
 }
+
+// ---- NEU: Standby-Endpoint ----
+void handleStandbyPost(){
+  if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
+  StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  if(doc["standby"].is<bool>()){
+    standby = doc["standby"].as<bool>();
+    if(standby){ mode=DisplayMode::STANDBY; displayClear(); }
+    else { if(mode==DisplayMode::STANDBY) mode=DisplayMode::COUNTDOWN; nextPollAt = millis()+500; }
+  }
+  String out = String("{\"ok\":true,\"standby\":") + (standby?"true":"false") + "}";
+  server.send(200,"application/json", out);
+}
+
 void handleFetchNow(){
   int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; backoffMs=20000; }
   int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
@@ -641,8 +704,6 @@ void handleFactoryReset(){ LittleFS.remove("/config.json"); server.send(200,"app
 void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sendHeader("Access-Control-Allow-Headers","Content-Type"); server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS"); }
 
 // ---------- Setup/Loop ----------
-enum class DisplayMode : uint8_t; // (forward, already defined above)
-
 void setup(){
   Serial.begin(115200); delay(200); Serial.println(); Serial.println("Booting… F_CPU="+String(F_CPU));
 
@@ -672,12 +733,14 @@ void setup(){
   server.on("/api/display",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/fetch-now",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/factoryreset",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
+  server.on("/api/standby",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
 
   server.on("/api/config", HTTP_POST, [](){ addCORS(); handleConfigPost(); });
   server.on("/api/led", HTTP_POST, [](){ addCORS(); handleLedPost(); });
   server.on("/api/display", HTTP_POST, [](){ addCORS(); handleDisplayPost(); });
   server.on("/api/fetch-now", HTTP_POST, [](){ addCORS(); handleFetchNow(); });
   server.on("/api/factoryreset", HTTP_POST, [](){ addCORS(); handleFactoryReset(); });
+  server.on("/api/standby", HTTP_POST, [](){ addCORS(); handleStandbyPost(); });
 
   server.on("/status-log", HTTP_GET, [](){ addCORS(); server.send(200,"text/plain", ringLog); });
 
@@ -695,7 +758,7 @@ void loop(){
   // 1s LED/Anzeige tick
   if(millis() >= nextTickAt){
     nextTickAt += 1000;
-    if(cfg.ledPower){
+    if(cfg.ledPower && !standby){
       uint8_t r,g,b; pickColorForSeconds(secondsToBus, r,g,b);
       if(mode==DisplayMode::COUNTDOWN){
         if(secondsToBus>0){ secondsToBus--; displayDigitsMMSS(secondsToBus,r,g,b); }
@@ -707,7 +770,7 @@ void loop(){
   }
 
   // Poll WL
-  if(millis() >= nextPollAt){
+  if(!standby && millis() >= nextPollAt){
     int s = fetchBusCountdown();
     if(s>=0){ secondsToBus=s; backoffMs=20000; }
     else { backoffMs = backoffMs*2; if(backoffMs>300000UL) backoffMs=300000UL; }
