@@ -1,19 +1,18 @@
 /*
   Wiener Linien Countdown + NeoPixel 7-Segment mit REST-API
-  - Web UI (mobil-optimiert) auf /
+  - Mobil-optimierte Setup-/Status-Seite auf /
     * Formular (SSID/Passwort/RBL/API-Key)
     * Live-Countdown (MM:SS), farbig wie LEDs
-    * Logfenster (letzte WL-JSON-Antwort, gekürzt)
+    * Logfenster mit letzter WL-JSON-Antwort
     * LED-Steuerung: Power, Brightness, 3 Farben + 2 Schwellwerte
     * Standby-Button (LEDs AUS + Polling pausiert)
-  - Berechnung:
-    * serverTime (aus JSON) als "Jetzt"
-    * Nimm timeReal[0]; wenn diff < 0 => nimm timeReal[1]
-    * Falls keine timeReal verfügbar ⇒ nimm countdown (Minuten) als Fallback
-    * Niemals "countdown" bevorzugen, nur Fallback
-  - Robust: reine Stringsuche (kein Deserialization/TooDeep)
-  - Poll-Logik: 200 + Body => 20s; sonst 5s
-  - OTA + mDNS, LittleFS; HTTPS optional mit Fingerprint (sonst insecure)
+    * LittleFS formatieren (Button mit Bestätigung)
+  - Countdown-Berechnung NUR: time(dep) - time(now) (niemals API 'countdown')
+  - Robust: stromorientierte JSON-Suche über alle timeReal/Planned (keine TooDeep)
+  - NTP-Racefix (timeSynced): es wird erst nach Zeit-Sync gerechnet
+  - Serial-Logs inkl. Sekunden & MM:SS
+  - HTTPS: Fingerprint optional; sonst setInsecure()
+  - OTA + mDNS, LittleFS
 */
 
 #include <ESP8266WiFi.h>
@@ -24,7 +23,7 @@
 #include <ArduinoOTA.h>
 #include <Adafruit_NeoPixel.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>   // nur für Konfig speichern/lesen
+#include <ArduinoJson.h>
 #include <time.h>
 
 // ---------- Hardware ----------
@@ -53,12 +52,12 @@ struct AppConfig {
 
   // Farbe & Schwellen (Sekunden)
   uint16_t tLow = 30;       // < tLow  => lowColor
-  uint16_t tMid = 90;       // < tMid  => midColor; >= tMid => highColor
+  uint16_t tMid = 90;       // < tMid  => midColor ; >= tMid => highColor
   uint8_t  colLow[3]  = {255, 0,   0};   // rot
   uint8_t  colMid[3]  = {255, 180, 0};   // gelb
   uint8_t  colHigh[3] = {0,   255, 0};   // grün
 
-  // HTTPS / Zeitzone (TZ nur für Systemzeit im Status/Fallback)
+  // HTTPS / Zeitzone
   bool httpsInsecure = false;
   String httpsFingerprint = "";
   String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
@@ -66,7 +65,7 @@ struct AppConfig {
 
 String lastDisplayValue = "----";
 String ringLog;
-String lastPayload;                 // volle letzte API-JSON (ggf. gekürzt)
+String lastPayload;                 // volle letzte API-JSON (gekürzt)
 unsigned long lastUpdateMs = 0;     // millis() der letzten erfolgreichen Abfrage
 int secondsToBus = 0;
 bool blinkState = false;
@@ -75,12 +74,22 @@ unsigned long nextPollAt = 0;
 unsigned long nextTickAt = 0;
 unsigned long backoffMs = 20000;
 
-bool timeSynced = false;            // Systemzeit via NTP (nur für Status/Notfall)
+bool timeSynced = false;
 bool standby = false;               // Standby: LEDs aus & Polling pausiert
-const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
 
-// Poll-Steuerung (neu): 200+Body => true; sonst false
-bool lastFetchHadContent = false;
+bool fsMounted = false;
+
+bool ensureFS() {
+  if (fsMounted) return true;
+  fsMounted = LittleFS.begin();
+  if (!fsMounted) {
+    Serial.println("LittleFS.begin() failed");
+  }
+  return fsMounted;
+}
+
+
+const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
 
 // ---------- 7-Segment Mapping ----------
 const uint8_t digitSegmentMap[4][14] PROGMEM = {
@@ -97,98 +106,67 @@ const uint8_t digitPatterns[10][7] PROGMEM = {
 // ---------- HTML ----------
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="de"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>WL Display</title>
 <style>
-:root{
-  --bg:#0b0f14;--card:#121821;--ink:#eaf2ff;--dim:#a9b7cf;--accent:#3aa6ff;
-  --ok:#7ad96b;--warn:#f5c06a;--line:#1f2a38;--field:#0e1420
-}
-*{box-sizing:border-box}
-html,body{background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
+:root{--bg:#0b0f14;--card:#121821;--ink:#eaf2ff;--dim:#a9b7cf;--accent:#3aa6ff;--ok:#7ad96b;--warn:#f5c06a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
 .wrap{max-width:1100px;margin:0 auto;padding:20px}
 .grid{display:grid;gap:16px}
 @media(min-width:900px){.grid-2{grid-template-columns:1fr 1fr}}
-.card{
-  background:linear-gradient(180deg,#131a24,#0f1520);
-  border:1px solid var(--line);border-radius:16px;padding:clamp(14px,2.5vw,22px);
-  box-shadow:0 10px 30px rgba(0,0,0,.35)
-}
-h1{margin:0 0 6px;font-size:clamp(18px,4.5vw,24px)}
-p.lead{margin:0 0 14px;color:var(--dim)}
+.card{background:linear-gradient(180deg,#131a24,#0f1520);border:1px solid #1f2a38;border-radius:16px;padding:clamp(14px,2.5vw,22px);box-shadow:0 10px 30px rgba(0,0,0,.35)}
+h1{margin:0 0 6px;font-size:clamp(18px,4.5vw,24px)} p.lead{margin:0 0 14px;color:var(--dim)}
 label{font-size:13px;color:var(--dim);display:block;margin-bottom:6px}
-input,textarea,select{
-  width:100%;padding:12px;border-radius:12px;border:1px solid #253245;
-  background:var(--field);color:var(--ink);font-size:16px
-}
+input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid #253245;background:#0e1420;color:#eaf2ff;font-size:16px}
 input[type=range]{padding:0;height:36px}
 textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px rgba(58,166,255,.15)}
 .row{display:grid;gap:10px}
 .row-2{display:grid;gap:10px;grid-template-columns:1fr 1fr}
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  background:linear-gradient(180deg,#2a67ff,#154eff);color:#fff;border:none;
-  padding:12px 16px;border-radius:12px;font-weight:600;cursor:pointer
-}
+.btn{display:inline-flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#2a67ff,#154eff);color:#fff;border:none;
+     padding:12px 16px;border-radius:12px;font-weight:600;cursor:pointer}
 .btn.secondary{background:linear-gradient(180deg,#2b3548,#1d2535);border:1px solid #2a3648}
 .btn.warn{background:linear-gradient(180deg,#6f6b2a,#5a501b)}
 .kv{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:13px}
-.kv b{color:var(--ink)}
-.count{font-weight:800;font-size:clamp(40px,10vw,72px);letter-spacing:.04em;line-height:1.1}
+.kv b{color:var(--ink)} .count{font-weight:800;font-size:clamp(36px,12vw,64px);letter-spacing:.04em}
 .badge{display:inline-block;border-radius:999px;padding:6px 10px;font-size:12px;border:1px solid #2a3648;color:var(--dim)}
-.flex{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.pill{padding:8px 12px;border-radius:999px;border:1px solid #2a3648;background:var(--field)}
+.flex{display:flex;gap:12px;flex-wrap:wrap}
 .toast{position:fixed;left:12px;right:12px;bottom:12px;padding:14px;border-radius:12px;background:#132a17;color:#d5ffd0;border:1px solid #265c2c;display:none}
 .toast.err{background:#3a1114;color:#ffd7db;border-color:#7d262c}
-
-/* --- Color rows with thick preview bars --- */
-.color-row{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:12px;align-items:center}
-@media(max-width:600px){.color-row{grid-template-columns:1fr}}
-.preview{
-  width:100%;height:18px;border-radius:999px;border:1px solid #2a3648;
-  background:#1116; position:relative; overflow:hidden
-}
-.preview::after{
-  content:""; position:absolute; inset:0; background:var(--bar,#fff);
-}
-.swatch{
-  display:flex;align-items:center;gap:10px
-}
-.swatch input[type=color]{
-  width:44px;height:32px;border-radius:8px;padding:0;border:1px solid #2a3648;background:#000
-}
 .small{font-size:12px;color:var(--dim)}
+.warn{border-color:#6a5b2a;color:#f1da9a}
+.pill{padding:10px 14px;border-radius:999px;border:1px solid #2a3648;background:#0e1420}
+.color-row{display:grid;grid-template-columns:160px 1fr;gap:12px;align-items:center}
+.color-cell{display:flex;align-items:center;gap:10px}
+.color-input{appearance:none;border:1px solid #2a3648;border-radius:10px;width:46px;height:32px;padding:0;background:#0e1420}
+.color-input::-webkit-color-swatch{border:none;border-radius:8px}
+.color-input::-moz-color-swatch{border:none;border-radius:8px}
+.color-bar{height:12px;border-radius:999px;background:#111825;border:1px solid #2a3648;position:relative;overflow:hidden}
+.color-bar::after{content:"";position:absolute;inset:0;background:var(--bar,#111825)}
+.color-hex{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#a9b7cf;padding:4px 8px;border:1px solid #2a3648;border-radius:8px;background:#0e1420}
 </style>
 </head>
 <body>
 <div class="wrap grid grid-2">
-
-  <!-- Setup -->
   <div class="card">
     <h1>WL Display – Setup</h1>
-    <p class="lead">Verbinde das Gerät mit deinem WLAN und hinterlege RBL &amp; API-Key.</p>
+    <p class="lead">Verbinde das Gerät mit deinem WLAN und hinterlege RBL & API-Key.</p>
     <div class="grid" style="gap:12px">
       <div class="row"><label for="ssid">WLAN-SSID</label><input id="ssid" placeholder="MeinWLAN"></div>
       <div class="row"><label for="pwd">WLAN-Passwort</label><input id="pwd" type="password" placeholder="••••••••"></div>
       <div class="row"><label for="rbl">RBL</label><input id="rbl" inputmode="numeric" placeholder="z. B. 1184"></div>
       <div class="row"><label for="apikey">Wiener Linien API-Key</label><input id="apikey" placeholder="DEIN_API_KEY"></div>
       <div class="flex">
-        <button class="btn" id="saveBtn">Speichern &amp; neu starten</button>
+        <button class="btn" id="saveBtn">Speichern & neu starten</button>
         <button class="btn secondary" id="statusBtn">Status</button>
+        <button class="btn warn" id="fsFormatBtn" title="Formatiert LittleFS! Vorsicht.">LittleFS formatieren</button>
       </div>
-      <div class="kv">
-        <span>IP: <b id="ip">-</b></span>
-        <span>RSSI: <b id="rssi">-</b></span>
+      <div class="kv"><span>IP: <b id="ip">-</b></span><span>RSSI: <b id="rssi">-</b></span>
         <span class="badge" id="wlstate">WLAN: unbekannt</span>
-        <span class="badge" id="timesync">Zeit: unbekannt</span>
-      </div>
+        <span class="badge warn" id="timesync">Zeit: unbekannt</span></div>
       <p class="small">Erreichbar über <code>http://wldisplay.local</code> oder die zugewiesene IP.</p>
     </div>
   </div>
-
-  <!-- Live -->
   <div class="card">
     <h1>Live-Anzeige</h1>
     <p class="lead">Dieser Countdown spiegelt die 7-Segment Anzeige (MM:SS).</p>
@@ -197,26 +175,21 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <span class="badge" id="modeBadge">Modus: countdown</span>
       <span class="badge" id="nextSync">Sync in: -</span>
       <span class="badge" id="standbyBadge">Standby: aus</span>
-      <span class="badge" id="colorBadge"><span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:#eaf2ff;margin-right:6px;vertical-align:-1px"></span>Farbe</span>
     </div>
     <div class="row" style="margin-top:12px">
       <label for="log">Letzte WL-JSON-Antwort</label>
       <textarea id="log" readonly placeholder="Noch keine Daten …"></textarea>
     </div>
   </div>
-
-  <!-- LED & Farben -->
   <div class="card" style="grid-column:1 / -1">
-    <h1>LED &amp; Farben</h1>
+    <h1>LED & Farben</h1>
     <p class="lead">Leistung und Farben abhängig von der verbleibenden Zeit.</p>
-
-    <div class="flex">
+    <div class="flex" style="align-items:center;flex-wrap:wrap">
       <button class="btn" id="powerBtn">LED: an</button>
       <button class="btn warn" id="standbyBtn">Standby: aus</button>
       <div class="pill">Helligkeit: <b id="brightVal">0</b></div>
     </div>
-    <input id="brightRange" type="range" min="0" max="255" step="1" value="40"/>
-
+    <input id="brightRange" type="range" min="0" max="255" step="1" value="40" />
     <div class="row-2" style="margin-top:10px">
       <div class="row">
         <label>Rot unter (Sekunden)</label>
@@ -227,35 +200,32 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         <input id="tMid" type="number" min="0" max="3600" step="1" placeholder="90">
       </div>
     </div>
-
-    <div class="row" style="margin-top:6px">
+    <div class="row-2" style="margin-top:10px">
       <div class="color-row">
-        <div class="swatch">
-          <label for="cLow" style="margin:0">Farbe: Rot-Bereich</label>
-          <input id="cLow" type="color" value="#ff0000">
+        <label for="cLow">Farbe: Rot-Bereich</label>
+        <div class="color-cell">
+          <input id="cLow" type="color" class="color-input" value="#ff0000">
+          <div id="pLow" class="color-bar" style="--bar:#ff0000"></div>
+          <span id="hLow" class="color-hex">#ff0000</span>
         </div>
-        <div class="preview" id="pLow"></div>
+      </div>
+      <div class="color-row">
+        <label for="cMid">Farbe: Gelb-Bereich</label>
+        <div class="color-cell">
+          <input id="cMid" type="color" class="color-input" value="#ffb400">
+          <div id="pMid" class="color-bar" style="--bar:#ffb400"></div>
+          <span id="hMid" class="color-hex">#ffb400</span>
+        </div>
       </div>
     </div>
-    <div class="row" style="margin-top:6px">
-      <div class="color-row">
-        <div class="swatch">
-          <label for="cMid" style="margin:0">Farbe: Gelb-Bereich</label>
-          <input id="cMid" type="color" value="#ffb400">
-        </div>
-        <div class="preview" id="pMid"></div>
+    <div class="color-row" style="margin-top:10px">
+      <label for="cHigh">Farbe: Grün-Bereich</label>
+      <div class="color-cell">
+        <input id="cHigh" type="color" class="color-input" value="#00ff00">
+        <div id="pHigh" class="color-bar" style="--bar:#00ff00"></div>
+        <span id="hHigh" class="color-hex">#00ff00</span>
       </div>
     </div>
-    <div class="row" style="margin-top:6px">
-      <div class="color-row">
-        <div class="swatch">
-          <label for="cHigh" style="margin:0">Farbe: Grün-Bereich</label>
-          <input id="cHigh" type="color" value="#00ff00">
-        </div>
-        <div class="preview" id="pHigh"></div>
-      </div>
-    </div>
-
     <div class="flex" style="margin-top:12px">
       <button class="btn" id="ledSave">LED-Einstellungen speichern</button>
       <span class="badge" id="previewInfo">Vorschau entspricht Live-Countdown</span>
@@ -267,282 +237,232 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
 <script>
 (() => {
-  // ---------- Helpers ----------
-  const $  = (s) => document.querySelector(s);
-  const $$ = (s) => Array.from(document.querySelectorAll(s));
+  // ---------- helpers ----------
+  const $ = s => document.querySelector(s);
   const toast = (m, ok = true) => {
-    const t = $('#toast');
-    t.textContent = m;
-    t.className = 'toast' + (ok ? '' : ' err');
-    t.style.display = 'block';
-    setTimeout(() => (t.style.display = 'none'), 3500);
+    const t = $('#toast'); if (!t) return;
+    t.textContent = m; t.className = 'toast' + (ok ? '' : ' err');
+    t.style.display = 'block'; setTimeout(() => (t.style.display = 'none'), 3500);
   };
-  const hex2rgb = (h) => {
-    const x = h.replace('#', '');
-    return [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2, 4), 16), parseInt(x.slice(4, 6), 16)];
-  };
-  const rgb2hex = (r, g, b) => '#' + [r, g, b].map(v => ('0' + (v|0).toString(16)).slice(-2)).join('');
-  const fmt = (s) => (String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'));
+  const hex2rgb = h => { const x=h.replace('#',''); return [parseInt(x.slice(0,2),16),parseInt(x.slice(2,4),16),parseInt(x.slice(4,6),16)]; };
+  const rgb2hex = (r,g,b) => '#'+[r,g,b].map(v=>('0'+v.toString(16)).slice(-2)).join('');
+  const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
+  const setPreview = (Key, hex) => { const p=$('#p'+Key), h=$('#h'+Key); if(p) p.style.setProperty('--bar',hex); if(h) h.textContent=hex.toLowerCase(); };
 
-  // ---------- Suppression & Edit-Locks ----------
-  let suppressServerOverwriteUntil = 0; // Zeitstempel (ms) – bis dahin ignorieren wir Server->UI-Überschreiben
-  const suppress = (ms) => { suppressServerOverwriteUntil = Math.max(suppressServerOverwriteUntil, Date.now() + ms); };
-  const isSuppressed = () => Date.now() < suppressServerOverwriteUntil;
+  // ---------- state ----------
+  let secondsRemaining = 0, mode='countdown', syncCountdown=0, timeSynced=false, standby=false;
 
-  const editLocks = new Set(); // Feld-IDs, die lokal in Bearbeitung sind
-  const lockOn  = (id) => editLocks.add(id);
-  const lockOff = (id) => editLocks.delete(id);
-  const isLocked = (id) => editLocks.has(id);
+  // Werte aus UI
+  let thresholds = { low: 30, mid: 90 };
+  let colorsLocal = { low:'#ff0000', mid:'#ffb400', high:'#00ff00' };
 
-  // ---------- UI State ----------
-  let secondsRemaining = 0;
-  let timeSynced = false;
-  let mode = 'countdown';
-  let standby = false;
+  // Edit-/Dirty-Flags
+  const editing = { tLow:false, tMid:false, bright:false };
+  let thresholdsDirty = false;                // true, solange in Feldern editiert wird
+  let colorsDirty = false;                    // blockiert Server-Overwrite bei Farben
+  let suppressOverwriteUntil = 0;             // ms – Schonfrist nach Eingabe
 
-  // ---------- UI Updaters ----------
-  function setPowerBtn(on) {
-    $('#powerBtn').dataset.state = on ? 'on' : 'off';
-    $('#powerBtn').textContent = 'LED: ' + (on ? 'an' : 'aus');
-  }
-  function setStandbyState(on) {
-    standby = !!on;
-    $('#standbyBtn').textContent = 'Standby: ' + (standby ? 'an' : 'aus');
-    $('#standbyBadge').textContent = 'Standby: ' + (standby ? 'an' : 'aus');
-  }
-  function setCountdownColorFromServer(col) {
-    if (!col || col.length < 3) return;
-    // keine Überschreibung, wenn Farben aktuell editiert werden
-    if (isLocked('cLow') || isLocked('cMid') || isLocked('cHigh')) return;
-    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
-  }
-  function setBadgeWlan(ip, rssi) {
-    $('#ip').textContent = ip || '-';
-    $('#rssi').textContent = (rssi !== undefined && rssi !== null) ? rssi + ' dBm' : '-';
-    $('#wlstate').textContent = 'WLAN: ' + (ip ? 'verbunden' : 'getrennt');
-    $('#wlstate').style.borderColor = ip ? 'rgba(122,217,107,.6)' : '#7d262c';
-  }
-  function setBadgeTimeSync(synced) {
-    timeSynced = !!synced;
-    $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
-    $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
-  }
-  function applyServerThresholds(th) {
-    if (!th) return;
-    if (!isLocked('tLow') && th.low !== undefined) $('#tLow').value = th.low;
-    if (!isLocked('tMid') && th.mid !== undefined) $('#tMid').value = th.mid;
-  }
-  function applyServerColors(cs) {
-    if (!cs) return;
-    if (!isLocked('cLow')  && cs.low)  $('#cLow').value  = rgb2hex(cs.low[0],  cs.low[1],  cs.low[2]);
-    if (!isLocked('cMid')  && cs.mid)  $('#cMid').value  = rgb2hex(cs.mid[0],  cs.mid[1],  cs.mid[2]);
-    if (!isLocked('cHigh') && cs.high) $('#cHigh').value = rgb2hex(cs.high[0], cs.high[1], cs.high[2]);
-  }
+  const armSuppress = (ms=2500) => { suppressOverwriteUntil = Date.now()+ms; };
+  const allowServerOverwrite = () => Date.now() >= suppressOverwriteUntil;
 
-  // ---------- Server Sync ----------
-  async function refreshStatus() {
-    // Während Suppression keine UI-Überschreibung
-    if (isSuppressed()) return;
-    try {
-      const r = await fetch('/api/status', { cache: 'no-store' });
-      if (!r.ok) throw new Error(r.status);
-      const s = await r.json();
+  // ---------- kleine UI-Helfer ----------
+  const setPowerBtn = v => { const b=$('#powerBtn'); if(!b) return; b.dataset.state=v?'on':'off'; b.textContent='LED: '+(v?'an':'aus'); };
+  const setStandbyBtn = v => { standby=v; $('#standbyBtn').textContent='Standby: '+(v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); };
+  const setCountdownColorFromServer = col => { const el=$('#countMMSS'); if(!el) return; el.style.color = (!col||col.length<3)?'':rgb2hex(col[0],col[1],col[2]); };
 
-      // WLAN / Zeit
-      setBadgeWlan(s.ip, s.rssi);
-      setBadgeTimeSync(!!s.timeSynced);
-      mode = s.mode || 'countdown';
-      $('#modeBadge').textContent = 'Modus: ' + mode;
-
-      // Countdown & Standby
-      if (!standby) secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
-      setStandbyState(!!s.standby);
-
-      // LED-Settings
-      setPowerBtn(!!s.ledPower);
-      if (!isLocked('brightRange') && s.brightness !== undefined) {
-        $('#brightRange').value = s.brightness;
-        $('#brightVal').textContent = s.brightness;
-      }
-
-      // Farben/Schwellwerte aus Server übernehmen (wenn nicht gelockt/suppress)
-      applyServerThresholds(s.thresholds);
-      applyServerColors(s.colors);
-
-      // Farbe des Countdowns (nur wenn kein Farb-Edit aktiv)
-      if (!isLocked('cLow') && !isLocked('cMid') && !isLocked('cHigh')) {
-        setCountdownColorFromServer(s.currentColor);
-      }
-
-      // JSON-Log (nicht kritisch, daher separat ohne Strict)
-      try {
-        const l = await fetch('/api/last-payload', { cache: 'no-store' });
-        if (l.ok) $('#log').value = await l.text();
-      } catch (_) {}
-
-    } catch (e) {
-      // AP-Modus o.ä. – kein Toast-Spam
-    }
-  }
-
-  // ---------- POST Helpers ----------
-  async function postLed(payload, msgOk = 'LED-Settings übernommen') {
-    try {
-      const r = await fetch('/api/led', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!r.ok) throw new Error(r.status);
-      toast(msgOk);
-      suppress(1200); // kurze Ruhe, damit Rück-Sync nicht "flackert"
-    } catch (e) {
-      toast('Fehler: ' + e, false);
-    }
-  }
-
-  // ---------- Event Wiring ----------
-  // Setup speichern
-  $('#saveBtn').addEventListener('click', async () => {
-    const ssid   = $('#ssid').value.trim();
-    const password = $('#pwd').value;
-    const rbl    = $('#rbl').value.trim();
-    const apiKey = $('#apikey').value.trim();
-    if (!ssid || !rbl || !apiKey) {
-      toast('Bitte SSID, RBL und API-Key ausfüllen', false);
-      return;
-    }
-    try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ ssid, password, rbl, apiKey })
-      });
-      if (res.ok) {
-        toast('Gespeichert. Neustart…');
-        suppress(4000);
-        setTimeout(() => location.reload(), 3000);
-      } else {
-        toast('Fehler beim Speichern (' + res.status + ')', false);
-      }
-    } catch (e) {
-      toast('Netzwerkfehler: ' + e, false);
-    }
+  // ---------- Setup speichern ----------
+  $('#saveBtn')?.addEventListener('click', async () => {
+    const ssid=$('#ssid')?.value.trim(), password=$('#pwd')?.value ?? '', rbl=$('#rbl')?.value.trim(), apiKey=$('#apikey')?.value.trim();
+    if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
+    try{
+      const res = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password,rbl,apiKey})});
+      if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(),3000); } else toast('Fehler beim Speichern ('+res.status+')', false);
+    }catch(e){ toast('Netzwerkfehler: '+e, false); }
   });
-  $('#statusBtn').addEventListener('click', () => location.href = '/api/status');
+  $('#statusBtn')?.addEventListener('click', ()=>location.href='/api/status');
 
-  // Power
-  $('#powerBtn').addEventListener('click', () => {
-    const on = $('#powerBtn').dataset.state !== 'off';
+  // ---------- LittleFS format (falls Button vorhanden) ----------
+  $('#fsFormatBtn')?.addEventListener('click', async ()=>{
+    const conf = prompt('SCHREIBE "FORMAT" um LittleFS zu formatieren (alle Daten gehen verloren).');
+    if(conf!=='FORMAT'){ toast('Abgebrochen'); return; }
+    try{
+      const r = await fetch('/api/fs-format',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'FORMAT'})});
+      const j = await r.json();
+      if(r.ok && j.ok){ toast('LittleFS formatiert. Neustart…'); setTimeout(()=>location.reload(),2000); } else toast('Fehler: '+(j.error||r.status), false);
+    }catch(e){ toast('Netzwerkfehler: '+e, false); }
+  });
+
+  // ---------- LED Controls ----------
+  async function postLed(payload, {resetDirty=false}={}) {
+    try{
+      const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(!r.ok) throw new Error(r.status);
+      if(resetDirty){ colorsDirty=false; thresholdsDirty=false; }
+      toast('LED-Settings übernommen');
+    }catch(e){ toast('Fehler: '+e, false); }
+  }
+  $('#powerBtn')?.addEventListener('click', ()=>{
+    const on = $('#powerBtn').dataset.state!=='off';
     postLed({
       power: !on,
-      brightness: +$('#brightRange').value,
-      thresholds: { low: +$('#tLow').value || 0, mid: +$('#tMid').value || 0 },
-      colors: {
-        low:  hex2rgb($('#cLow').value),
-        mid:  hex2rgb($('#cMid').value),
-        high: hex2rgb($('#cHigh').value)
-      }
-    }, 'LED ' + (!on ? 'ein' : 'aus'));
-  });
-
-  // Standby
-  $('#standbyBtn').addEventListener('click', async () => {
-    try {
-      const r = await fetch('/api/standby', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ standby: !standby })
-      });
-      if (!r.ok) throw new Error(r.status);
-      const j = await r.json();
-      setStandbyState(!!j.standby);
-      toast('Standby ' + (j.standby ? 'aktiviert' : 'deaktiviert'));
-      suppress(1500);
-    } catch (e) { toast('Fehler: ' + e, false); }
-  });
-
-  // Brightness + Thresholds – Locks & Suppression
-  [['brightRange', 10000], ['tLow', 10000], ['tMid', 10000]].forEach(([id, ms]) => {
-    const el = $('#' + id);
-    el.addEventListener('focus', () => lockOn(id));
-    el.addEventListener('input', () => {
-      if (id === 'brightRange') $('#brightVal').textContent = el.value;
-      suppress(ms);
+      brightness: +($('#brightRange')?.value ?? 40),
+      thresholds: { low:+($('#tLow')?.value ?? thresholds.low), mid:+($('#tMid')?.value ?? thresholds.mid) },
+      colors: { low:hex2rgb(colorsLocal.low), mid:hex2rgb(colorsLocal.mid), high:hex2rgb(colorsLocal.high) }
     });
-    el.addEventListener('change', () => suppress(ms));
-    el.addEventListener('blur',  () => { lockOff(id); suppress(3000); });
+  });
+  $('#standbyBtn')?.addEventListener('click', async ()=>{
+    try{
+      const r = await fetch('/api/standby',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({standby:!standby})});
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json(); setStandbyBtn(!!j.standby);
+      toast('Standby '+(j.standby?'aktiviert':'deaktiviert'));
+    }catch(e){ toast('Fehler: '+e, false); }
   });
 
-  // Color Inputs – Locks & Suppression + Live-Farbanzeige
-  function updateCountdownPreview() {
-    // nur optische Vorschau für Countdown-Farbe: Priorität High > Mid > Low anhand Sekunden
-    const low  = hex2rgb($('#cLow').value);
-    const mid  = hex2rgb($('#cMid').value);
-    const high = hex2rgb($('#cHigh').value);
-    const tLow = +$('#tLow').value || 30;
-    const tMid = +$('#tMid').value || 90;
-    let col = high;
-    if (secondsRemaining < Math.min(tLow, tMid)) col = low;
-    else if (secondsRemaining < Math.max(tLow, tMid)) col = mid;
-    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
-  }
-  ['cLow','cMid','cHigh'].forEach(id => {
-    const el = $('#' + id);
-    el.addEventListener('focus', () => { lockOn(id); suppress(15000); });
-    el.addEventListener('input', () => { updateCountdownPreview(); suppress(15000); });
-    el.addEventListener('change', () => { updateCountdownPreview(); suppress(15000); });
-    el.addEventListener('blur',  () => { lockOff(id); updateCountdownPreview(); suppress(5000); });
+  // Helligkeit (mit Edit-Lock)
+  $('#brightRange')?.addEventListener('focus', ()=>editing.bright=true);
+  $('#brightRange')?.addEventListener('blur',  ()=>editing.bright=false);
+  $('#brightRange')?.addEventListener('input', e=>{$('#brightVal').textContent=e.target.value; thresholdsDirty=true; armSuppress();});
+  $('#brightRange')?.addEventListener('change', e=>postLed({brightness:+e.target.value}));
+
+  // Sekunden-Felder: Edit-Locks + Schonfrist
+  ['tLow','tMid'].forEach(id=>{
+    const el = $('#'+id); if(!el) return;
+    el.addEventListener('focus', ()=>{ editing[id]=true; });
+    el.addEventListener('blur',  ()=>{ editing[id]=false; });
+    el.addEventListener('input', ()=>{
+      thresholds.low = +($('#tLow')?.value ?? thresholds.low);
+      thresholds.mid = +($('#tMid')?.value ?? thresholds.mid);
+      thresholdsDirty = true;      // markiere: Nutzer editiert
+      armSuppress(3000);           // 3s nicht überschreiben
+    });
   });
 
-  // „Speichern“ für LED-Settings
-  $('#ledSave').addEventListener('click', () => {
-    const payload = {
-      power: $('#powerBtn').dataset.state !== 'off',
-      brightness: +$('#brightRange').value,
-      thresholds: {
-        low: +$('#tLow').value || 0,
-        mid: +$('#tMid').value || 0
-      },
-      colors: {
-        low:  hex2rgb($('#cLow').value),
-        mid:  hex2rgb($('#cMid').value),
-        high: hex2rgb($('#cHigh').value)
+  // Farb-Inputs: lokale Vorschau + Dirty, verhindern Overwrite bis Speichern
+  [['Low','low'],['Mid','mid'],['High','high']].forEach(([Key,key])=>{
+    const el = $('#c'+Key); if(!el) return;
+    el.addEventListener('input', e=>{
+      colorsLocal[key] = e.target.value;
+      setPreview(Key, e.target.value);
+      colorsDirty = true;
+      armSuppress(3000);
+    });
+  });
+
+  // Speichern-Button der LED-Sektion
+  $('#ledSave')?.addEventListener('click', ()=>{
+    postLed({
+      power: $('#powerBtn').dataset.state!=='off',
+      brightness: +($('#brightRange')?.value ?? 40),
+      thresholds: { low:+($('#tLow')?.value ?? thresholds.low), mid:+($('#tMid')?.value ?? thresholds.mid) },
+      colors: { low:hex2rgb(colorsLocal.low), mid:hex2rgb(colorsLocal.mid), high:hex2rgb(colorsLocal.high) }
+    }, {resetDirty:true});
+  });
+
+  // ---------- Status holen & UI updaten (respektiert Edit-Locks) ----------
+  async function refreshStatus(){
+    try{
+      const r = await fetch('/api/status',{cache:'no-store'});
+      if(!r.ok) throw new Error(r.status);
+      const s = await r.json();
+
+      // WLAN/Zeit
+      $('#ip').textContent = s.ip || '-';
+      $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
+      $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
+      $('#wlstate').style.borderColor = s.ip ? 'rgba(122,217,107,.6)' : '#7d262c';
+      timeSynced = !!s.timeSynced;
+      $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
+      $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
+
+      // Countdown/Modus/Standby
+      mode = s.mode || 'countdown';
+      $('#modeBadge').textContent = 'Modus: ' + mode;
+      secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
+      setStandbyBtn(!!s.standby);
+
+      // LED-Basics
+      setPowerBtn(!!s.ledPower);
+      if(!editing.bright && allowServerOverwrite()){
+        $('#brightRange').value = s.brightness ?? 40;
+        $('#brightVal').textContent = $('#brightRange').value;
       }
-    };
-    postLed(payload, 'LED-Einstellungen gespeichert');
-    // kleine Nachlauf-Suppression, damit der nachfolgende Status-Pull nicht sofort "hart" überschreibt
-    suppress(2000);
-  });
 
-  // ---------- Client-Timer ----------
-  // Sekundentick (nur Anzeige)
-  setInterval(() => {
-    if (mode === 'off' || !timeSynced || standby) { $('#countMMSS').textContent = '--:--'; return; }
-    if (secondsRemaining > 0) secondsRemaining--;
+      // --- WICHTIG: Schwellen nur setzen, wenn NICHT editiert wird und keine Schonfrist aktiv ist ---
+      if(allowServerOverwrite()){
+        if(!editing.tLow && s.thresholds?.low !== undefined && !thresholdsDirty){
+          $('#tLow').value = s.thresholds.low;
+          thresholds.low = s.thresholds.low;
+        }
+        if(!editing.tMid && s.thresholds?.mid !== undefined && !thresholdsDirty){
+          $('#tMid').value = s.thresholds.mid;
+          thresholds.mid = s.thresholds.mid;
+        }
+      }
+
+      // Farben nur überschreiben, wenn nicht dirty & keine Schonfrist
+      if(s.colors && !colorsDirty && allowServerOverwrite()){
+        const l = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
+        const m = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
+        const h = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
+        colorsLocal = { low:l, mid:m, high:h };
+        $('#cLow').value=l;  setPreview('Low', l);
+        $('#cMid').value=m;  setPreview('Mid', m);
+        $('#cHigh').value=h; setPreview('High', h);
+      }
+
+      // Log
+      try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok) $('#log').value = await l.text(); }catch(_){}
+
+      syncCountdown = timeSynced ? 5 : 1;
+      setCountdownColorFromServer(s.currentColor);
+    }catch(e){ /* ok in AP-Mode */ }
+  }
+
+  // ---------- Ticker ----------
+  setInterval(()=>{
+    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
+    if(secondsRemaining>0) secondsRemaining--;
     $('#countMMSS').textContent = fmt(secondsRemaining);
-  }, 1000);
+    if(syncCountdown>0) syncCountdown--;
+    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
+  },1000);
 
-  // Status polling (respektiert Suppression in refreshStatus)
   setInterval(refreshStatus, 1000);
+
+  // init: Previews aus aktuellen Inputs
+  const initL = $('#cLow')?.value || colorsLocal.low;
+  const initM = $('#cMid')?.value || colorsLocal.mid;
+  const initH = $('#cHigh')?.value || colorsLocal.high;
+  colorsLocal = { low:initL, mid:initM, high:initH };
+  setPreview('Low', initL); setPreview('Mid', initM); setPreview('High', initH);
+
   refreshStatus();
 })();
 </script>
+
 </body>
 </html>
 )HTML";
-
 
 // ---------- Hilfen ----------
 void logLine(const String &s) {
   Serial.println(s);
   ringLog += s; ringLog += "\n";
-  if (ringLog.length() > 6000) ringLog.remove(0, ringLog.length() - 6000);
+  if (ringLog.length() > 6000)
+    ringLog.remove(0, ringLog.length() - 6000);
+}
+
+bool fsInfo(size_t &total, size_t &used) {
+  FSInfo i;
+  if (!LittleFS.info(i)) return false;
+  total = i.totalBytes;
+  used  = i.usedBytes;
+  return true;
 }
 
 // ISO-8601 → epoch (UTC) inkl. Offset (+hhmm / Z)
 time_t parseISO8601_UTC_to_epoch(const String& iso){
-  if(iso.length() < 20) return 0;
   int Y=iso.substring(0,4).toInt();
   int M=iso.substring(5,7).toInt();
   int D=iso.substring(8,10).toInt();
@@ -560,60 +480,20 @@ time_t parseISO8601_UTC_to_epoch(const String& iso){
     }
   }
 
-  struct tm t = {};
-  t.tm_year=Y-1900; t.tm_mon=M-1; t.tm_mday=D; t.tm_hour=h; t.tm_min=m; t.tm_sec=s;
-
-  // mktime mit UTC (TZ=UTC0)
-  char *oldtz = getenv("TZ");
-  setenv("TZ","UTC0",1); tzset();
+  tm t = {}; t.tm_year=Y-1900; t.tm_mon=M-1; t.tm_mday=D; t.tm_hour=h; t.tm_min=m; t.tm_sec=s;
+  char *oldtz = getenv("TZ"); setenv("TZ","UTC0",1); tzset();
   time_t epoch = mktime(&t);
   if (oldtz) setenv("TZ", oldtz, 1); else unsetenv("TZ"); tzset();
 
-  // Offset abziehen, um echte UTC zu bekommen
   epoch -= offSign * (offH*3600 + offMin*60);
   return epoch;
 }
 
-// String-Helfer: erstbesten Wert nach needle holen ("\"key\":\"")
-bool findQuotedValue(const String& src, const String& needle, String& out, int startPos=0) {
-  int k = src.indexOf(needle, startPos);
-  if (k < 0) return false;
-  int sidx = k + needle.length();
-  int eidx = src.indexOf('"', sidx);
-  if (eidx < 0) return false;
-  out = src.substring(sidx, eidx);
-  return true;
-}
-
-// N-tes Auftreten von timeReal holen
-bool findTimeRealNth(const String& src, int nth, String& isoOut) {
-  const String needle = "\"timeReal\":\"";
-  int pos = 0;
-  for (int i=0;i<=nth;i++){
-    int k = src.indexOf(needle, pos);
-    if (k < 0) return false;
-    int sidx = k + needle.length();
-    int eidx = src.indexOf('"', sidx);
-    if (eidx < 0) return false;
-    isoOut = src.substring(sidx, eidx);
-    pos = eidx + 1;
-  }
-  return true;
-}
-
-// Erstes countdown-Feld (als Minuten) holen
-bool findCountdownFirst(const String& src, int &minutesOut){
-  const String needle = "\"countdown\":";
-  int k = src.indexOf(needle);
-  if (k < 0) return false;
-  int sidx = k + needle.length();
-  // überspringe evtl. Leerzeichen
-  while (sidx < (int)src.length() && (src[sidx]==' ' || src[sidx]=='\t')) sidx++;
-  // Zahl parsen
-  int e = sidx;
-  while (e < (int)src.length() && isdigit(src[e])) e++;
-  if (e == sidx) return false;
-  minutesOut = src.substring(sidx, e).toInt();
+// sauberes ISO aus JSON-Text holen (bis zum schließenden Anführungszeichen)
+bool extractIsoAfter(const String& src, int startIdx, String& out) {
+  int end = src.indexOf('"', startIdx);
+  if (end < 0) return false;
+  out = src.substring(startIdx, end);
   return true;
 }
 
@@ -650,8 +530,13 @@ void pickColorForSeconds(int secs, uint8_t &r,uint8_t &g,uint8_t &b){
   else { r=cfg.colHigh[0]; g=cfg.colHigh[1]; b=cfg.colHigh[2]; }
 }
 
-// ---------- Config ----------
 bool saveConfig(){
+  if(!ensureFS()){
+    Serial.println("saveConfig: FS not mounted");
+    return false;
+  }
+
+  // JSON bauen
   StaticJsonDocument<640> doc;
   doc["ssid"]=cfg.ssid; doc["password"]=cfg.password; doc["apiKey"]=cfg.apiKey; doc["rbl"]=cfg.rbl;
   doc["brightness"]=cfg.brightness; doc["ledPower"]=cfg.ledPower;
@@ -659,27 +544,140 @@ bool saveConfig(){
   JsonArray low = doc.createNestedArray("colLow");  low.add(cfg.colLow[0]);  low.add(cfg.colLow[1]);  low.add(cfg.colLow[2]);
   JsonArray mid = doc.createNestedArray("colMid");  mid.add(cfg.colMid[0]);  mid.add(cfg.colMid[1]);  mid.add(cfg.colMid[2]);
   JsonArray hig = doc.createNestedArray("colHigh"); hig.add(cfg.colHigh[0]); hig.add(cfg.colHigh[1]); hig.add(cfg.colHigh[2]);
-  doc["httpsInsecure"]=cfg.httpsInsecure; doc["httpsFingerprint"]=cfg.httpsFingerprint; doc["tz"]=cfg.tz;
-  File f = LittleFS.open("/config.json","w"); if(!f){ logLine("Fehler beim Öffnen von /config.json zum Schreiben!"); return false; }
-  serializeJson(doc,f); f.close();
-  logLine("---LittleFS gespeichert---");
-  logLine("SSID: "+cfg.ssid); logLine("Passwort: "+cfg.password); logLine("API-Key: "+cfg.apiKey); logLine("RBL: "+cfg.rbl);
-  return true;
+  doc["httpsInsecure"]=cfg.httpsInsecure; doc["httpsFingerprint"]=cfg.httpsFingerprint;
+
+  String json; json.reserve(768);
+  size_t want = serializeJson(doc, json);
+  if (want == 0){ Serial.println("saveConfig: serializeJson produced 0B"); return false; }
+
+  auto writeTmp = [&](const char* name)->size_t{
+    File f = LittleFS.open(name, "w");
+    if(!f){ Serial.printf("saveConfig: open(%s) failed\n", name); return 0; }
+    size_t n = f.write((const uint8_t*)json.c_str(), json.length());
+    f.flush();
+    f.close();
+    return n;
+  };
+
+  // Versuch #1
+  size_t written = writeTmp("/config.tmp");
+  Serial.printf("saveConfig: geplant=%uB, geschrieben=%uB (try#1)\n", (unsigned)want, (unsigned)written);
+
+  // Falls 0B: einmal Format + Retry
+  if (written == 0){
+    size_t tot=0, used=0;
+    if (fsInfo(tot,used)) Serial.printf("FS vor Format: used=%u / total=%u\n", (unsigned)used, (unsigned)tot);
+    LittleFS.end(); delay(25);
+    LittleFS.format(); delay(25);
+    fsMounted = LittleFS.begin();
+    if (!fsMounted){ Serial.println("saveConfig: mount after format failed"); return false; }
+    written = writeTmp("/config.tmp");
+    Serial.printf("saveConfig: geschrieben=%uB (try#2)\n", (unsigned)written);
+  }
+
+  if (written == 0){
+    Serial.println("saveConfig: both writes were 0B → abort");
+    LittleFS.remove("/config.tmp");
+    return false;
+  }
+
+  // Verifizieren, was wirklich im Flash steht
+  File v = LittleFS.open("/config.tmp","r");
+  if(!v){ Serial.println("saveConfig: verify open failed"); LittleFS.remove("/config.tmp"); return false; }
+  size_t vsz = v.size();
+  String vstr = v.readString();
+  v.close();
+
+  if (vsz == 0 || vstr.length() == 0){
+    Serial.println("saveConfig: verify read is 0B → abort");
+    LittleFS.remove("/config.tmp");
+    return false;
+  }
+
+  // Atomar ersetzen
+  LittleFS.remove("/config.json");
+  if(!LittleFS.rename("/config.tmp","/config.json")){
+    Serial.println("saveConfig: rename tmp→json failed");
+    LittleFS.remove("/config.tmp");
+    return false;
+  }
+
+  // Final: zur Kontrolle nochmal öffnen
+  File r = LittleFS.open("/config.json","r");
+  if(!r){
+    Serial.println("saveConfig: /config.json not readable after rename");
+    return false;
+  }
+  size_t sz = r.size();
+  String prev = r.readString();
+  r.close();
+
+  Serial.printf("---LittleFS gespeichert--- %u Bytes\n", (unsigned)sz);
+  Serial.print("config.json preview: ");
+  Serial.println(prev);
+
+  // kurze Gnadenfrist für den Flash
+  delay(50);
+  return (sz > 0);
 }
+
+
 void loadConfig(){
-  if(!LittleFS.exists("/config.json")){ logLine("---LittleFS: Noch keine Konfiguration gespeichert.---"); return; }
-  File f = LittleFS.open("/config.json","r"); if(!f){ logLine("Fehler beim Öffnen von /config.json zum Lesen!"); return; }
-  StaticJsonDocument<1024> doc; DeserializationError err = deserializeJson(doc,f); f.close(); if(err){ logLine("Config JSON parse failed"); return; }
-  cfg.ssid = doc["ssid"] | ""; cfg.password = doc["password"] | ""; cfg.apiKey = doc["apiKey"] | ""; cfg.rbl = doc["rbl"] | "";
-  cfg.brightness = doc["brightness"] | 40; cfg.ledPower = doc["ledPower"] | true;
-  cfg.tLow = doc["tLow"] | 30; cfg.tMid = doc["tMid"] | 90;
-  if(doc["colLow"].is<JsonArray>()){ cfg.colLow[0]=doc["colLow"][0] | 255; cfg.colLow[1]=doc["colLow"][1] | 0; cfg.colLow[2]=doc["colLow"][2] | 0; }
-  if(doc["colMid"].is<JsonArray>()){ cfg.colMid[0]=doc["colMid"][0] | 255; cfg.colMid[1]=doc["colMid"][1] | 180; cfg.colMid[2]=doc["colMid"][2] | 0; }
-  if(doc["colHigh"].is<JsonArray>()){ cfg.colHigh[0]=doc["colHigh"][0] | 0; cfg.colHigh[1]=doc["colHigh"][1] | 255; cfg.colHigh[2]=doc["colHigh"][2] | 0; }
-  cfg.httpsInsecure = doc["httpsInsecure"] | false; cfg.httpsFingerprint = doc["httpsFingerprint"] | ""; cfg.tz = doc["tz"] | "CET-1CEST,M3.5.0,M10.5.0/3";
-  logLine("---LittleFS Konfig geladen---");
-  logLine("SSID: "+cfg.ssid); logLine("Passwort: "+cfg.password); logLine("API-Key: "+cfg.apiKey); logLine("RBL: "+cfg.rbl);
+  if(!ensureFS()){
+    Serial.println("loadConfig: FS not mounted");
+    return;
+  }
+
+  if(!LittleFS.exists("/config.json")){
+    Serial.println("---LittleFS: Noch keine Konfiguration gespeichert.---");
+    return;
+  }
+
+  File f = LittleFS.open("/config.json","r");
+  if(!f){ Serial.println("loadConfig: open failed"); return; }
+
+  size_t sz = f.size();
+  String raw = f.readString();
+  f.close();
+
+  Serial.printf("config.json size: %u Bytes\n", (unsigned)sz);
+  Serial.print("config.json preview: ");
+  Serial.println(raw);
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, raw);
+  if(err){
+    Serial.print("Config JSON parse failed: "); Serial.println(err.c_str());
+    // Beschädigte Datei wegwerfen, damit das Gerät wieder konfigurierbar ist
+    LittleFS.remove("/config.json");
+    return;
+  }
+
+  cfg.ssid       = doc["ssid"]       | "";
+  cfg.password   = doc["password"]   | "";
+  cfg.apiKey     = doc["apiKey"]     | "";
+  cfg.rbl        = doc["rbl"]        | "";
+  cfg.brightness = doc["brightness"] | 40;
+  cfg.ledPower   = doc["ledPower"]   | true;
+  cfg.tLow       = doc["tLow"]       | 30;
+  cfg.tMid       = doc["tMid"]       | 90;
+
+  if (doc["colLow"].is<JsonArray>()){
+    cfg.colLow[0]=doc["colLow"][0] | 255; cfg.colLow[1]=doc["colLow"][1] | 0;   cfg.colLow[2]=doc["colLow"][2] | 0;
+  }
+  if (doc["colMid"].is<JsonArray>()){
+    cfg.colMid[0]=doc["colMid"][0] | 255; cfg.colMid[1]=doc["colMid"][1] | 180; cfg.colMid[2]=doc["colMid"][2] | 0;
+  }
+  if (doc["colHigh"].is<JsonArray>()){
+    cfg.colHigh[0]=doc["colHigh"][0] | 0;   cfg.colHigh[1]=doc["colHigh"][1] | 255; cfg.colHigh[2]=doc["colHigh"][2] | 0;
+  }
+
+  cfg.httpsInsecure    = doc["httpsInsecure"]    | false;
+  cfg.httpsFingerprint = doc["httpsFingerprint"] | "";
+
+  Serial.println("---LittleFS Konfig geladen---");
 }
+
 
 // ---------- WiFi/NTP ----------
 void ensureWifi(){
@@ -707,165 +705,218 @@ bool ensureTime() {
   return timeSynced;
 }
 
-int fetchBusCountdown(){
-  if (standby) return -1;
-  ensureWifi();
-  if (WiFi.status()!=WL_CONNECTED) { lastFetchHadContent=false; return -1; }
+// findet die erste Zeichenkette nach needle und gibt sie in out zurück (endet am nächsten ")
+static bool scanQuotedAfter(const String& src, int from, const char* needle, String& out, int &posOut){
+  int k = src.indexOf(needle, from);
+  if (k < 0) return false;
+  int sidx = k + strlen(needle);
+  int eidx = src.indexOf('"', sidx);
+  if (eidx < 0) return false;
+  out = src.substring(sidx, eidx);
+  posOut = eidx + 1;
+  return true;
+}
 
-  // Zeit fürs Log
-  time_t now=time(nullptr); struct tm *tm_ = localtime(&now); char tbuf[10]; sprintf(tbuf,"%02d:%02d:%02d",tm_->tm_hour,tm_->tm_min,tm_->tm_sec);
+// findet eine Ganzzahl nach needle (z.B. "countdown":123), tolerant auf Leerzeichen/Komma
+static bool scanIntAfter(const String& src, int from, const char* needle, int &value, int &posOut){
+  int k = src.indexOf(needle, from);
+  if (k < 0) return false;
+  int sidx = k + strlen(needle);
+  // skip spaces
+  while (sidx < (int)src.length() && (src[sidx]==' ' || src[sidx]=='\t')) sidx++;
+  // lese Zahl (optional +/-)
+  int e = sidx;
+  bool neg=false; if (e<(int)src.length() && (src[e]=='-'||src[e]=='+')) { neg = (src[e]=='-'); e++; }
+  long val=0; bool any=false;
+  while (e<(int)src.length() && isDigit(src[e])) { val = val*10 + (src[e]-'0'); e++; any=true; }
+  if(!any) return false;
+  value = neg ? -(int)val : (int)val;
+  posOut = e;
+  return true;
+}
 
-  String url = "https://www.wienerlinien.at/ogd_realtime/monitor?rbl="+cfg.rbl+"&activateTrafficInfo=stoerungkurz&sender="+cfg.apiKey;
+// --- robustes HTTP-GET mit Stream-Lesen & Diagnostik ---
+bool httpGetJson(const String& url, String& out, BearSSL::WiFiClientSecure& client) {
+  auto do_request = [&](String& dst)->int {
+    HTTPClient http;
+    http.setTimeout(12000);                    // großzügiger Timeout
+    http.useHTTP10(true);                      // kein chunked, sauberer Close
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.addHeader("Accept-Encoding", "identity"); // keine gzip-Kompression
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "ESP8266-WLDisplay");
 
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  // (Optional) etwas größere Puffer gegen TLS-Truncation
-  client->setBufferSizes(512, 4096);
+    if (!http.begin(client, url)) {
+      Serial.println("HTTP begin failed");
+      return -1000;
+    }
 
-  if(cfg.httpsFingerprint.length()>0){ client->setFingerprint(cfg.httpsFingerprint.c_str()); logLine("TLS: Fingerprint-Pinning aktiv"); }
-  else if(cfg.httpsInsecure){ client->setInsecure(); logLine("TLS: INSECURE (testweise)"); }
-  else { client->setInsecure(); logLine("TLS: Fallback insecure (kein Fingerprint gesetzt)"); }
+    int code = http.GET();
+    Serial.println("HTTP Code: " + String(code));
 
-  HTTPClient http;
-  http.useHTTP10(true);                         // *** WICHTIG: kein chunked ***
-  http.setTimeout(12000);                       // genug Zeit lassen
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    // Header-Diagnostik (hilft beim Debuggen von 'leeren' Bodies)
+    String te = http.header("Transfer-Encoding");
+    String ce = http.header("Content-Encoding");
+    String cl = http.header("Content-Length");
+    if (te.length()) Serial.println("Hdr TE: " + te);
+    if (ce.length()) Serial.println("Hdr CE: " + ce);
+    if (cl.length()) Serial.println("Hdr CL: " + cl);
 
-  logLine("["+String(tbuf)+"] GET "+url);
-  if(!http.begin(*client, url)){ logLine("HTTP begin failed"); lastFetchHadContent=false; return -1; }
-
-  // Gzip abwählen & Verbindung schließen lassen
-  http.addHeader("Accept-Encoding","identity");
-  http.addHeader("Connection","close");
-  http.addHeader("User-Agent","ESP8266-WLDisplay/1.0");
-
-  int code = http.GET();
-  String payload;
-
-  if(code>0){
-    // Erst versuchen, Content-Length & direkten Read
-    int len = http.getSize();            // kann -1 sein bei unbekannter Länge
-    if(len > 0){
-      // Direkter Lese-Loop (robust)
-      WiFiClient * stream = http.getStreamPtr();
-      payload.reserve((size_t)len);
-      unsigned long deadline = millis()+12000;
-      while(http.connected() && (len > 0 || len == -1) && millis() < deadline){
-        while(stream->available()){
-          char c = (char)stream->read();
-          payload += c;
-          if(len > 0) len--;
+    dst = "";
+    if (code > 0) {
+      WiFiClient *stream = http.getStreamPtr();
+      const uint32_t t0 = millis();
+      dst.reserve(24576);
+      // Lies, solange verbunden oder Daten verfügbar und Timeout nicht erreicht
+      while ((http.connected() || stream->available()) && (millis() - t0) < 12000) {
+        while (stream->available()) {
+          dst += (char)stream->read();
+          if (dst.length() > 32768) break; // hartes Limit
         }
-        if(len == 0) break;
-        delay(1); yield();
-      }
-    } else {
-      // Unbekannte Länge (oder 0): lese bis Verbindungsende
-      WiFiClient * stream = http.getStreamPtr();
-      unsigned long deadline = millis()+12000;
-      while(stream->connected() && millis()<deadline){
-        while(stream->available()){
-          payload += (char)stream->read();
-        }
-        // wenn kurz nichts kommt, kleine Pause
-        delay(1); yield();
+        yield();
       }
     }
-  }
-
-  http.end();
-
-  // Erfolg/Fehler fürs Re-Polling merken
-  lastFetchHadContent = (code==200 && payload.length()>0);
-
-  // Serial-Log + lastPayload (gekürzt)
-  if(code==200) logLine("HTTP Code: 200");
-  else          logLine("HTTP Code: "+String(code));
-
-  if(payload.length()>0){
-    String vis = payload; vis.replace("\r","");
-    if(vis.length()>16384) vis.remove(16384);
-    lastPayload = vis;
-    size_t cut = vis.length()<1200? vis.length(): 1200;
-    logLine("["+String(tbuf)+"] API Payload (cut):");
-    if (cut) logLine(vis.substring(0,cut));
-    if (vis.length()>cut) logLine("...");
-  } else {
-    logLine("Body ist leer – Abbruch.");
-    return -1; // **wichtig**: keine Auswertung ohne Body
-  }
-
-  // ---- serverTime holen ----
-  String sServerIso;
-  if(payload.indexOf("\"serverTime\":\"")>=0){
-    int s = payload.indexOf("\"serverTime\":\"") + 14;
-    int e = payload.indexOf('"', s);
-    if(e> s) sServerIso = payload.substring(s,e);
-  }
-  time_t serverNow = sServerIso.length() ? parseISO8601_UTC_to_epoch(sServerIso) : time(nullptr);
-
-  // ---- timeReal[0] bzw. [1] ----
-  auto getNth = [&](int nth)->String{
-    const String needle="\"timeReal\":\"";
-    int pos=0;
-    for(int i=0;i<=nth;i++){
-      int k = payload.indexOf(needle,pos);
-      if(k<0) return String();
-      int s=k+needle.length(); int e=payload.indexOf('"',s);
-      if(e<0) return String();
-      String iso = payload.substring(s,e);
-      pos=e+1;
-      return (i==nth)? iso : String(); // return only when i==nth
-    }
-    return String();
+    http.end();
+    return code;
   };
 
-  String iso0 = getNth(0);
-  int bestSec = -1;
-  if(iso0.length()){
-    long d0 = (long)parseISO8601_UTC_to_epoch(iso0) - (long)serverNow;
-    if(d0>=0){
-      bestSec = (int)d0;
-      logLine(String("timeReal[0]: ")+iso0+"  Δ="+String(bestSec)+"s");
-    } else {
-      String iso1 = getNth(1);
-      if(iso1.length()){
-        long d1 = (long)parseISO8601_UTC_to_epoch(iso1) - (long)serverNow;
-        logLine(String("timeReal[0] negativ (Δ=")+String(d0)+"), nehme timeReal[1]: "+iso1+"  Δ="+String(d1)+"s");
-        if(d1>=0) bestSec=(int)d1;
-      } else {
-        logLine("timeReal[1] nicht vorhanden.");
-      }
+  out = "";
+  int code1 = do_request(out);
+
+  if (code1 == HTTP_CODE_OK && out.length() == 0) {
+    Serial.println("HTTP 200, aber Body leer → Sofort-Retry …");
+    delay(200);
+    // Für den Retry eine frische HTTP-Instanz verwenden:
+    String retryBody;
+    int code2 = do_request(retryBody);
+    Serial.println("Retry HTTP Code: " + String(code2));
+    if (code2 == HTTP_CODE_OK && retryBody.length() > 0) {
+      out = retryBody;
     }
+  }
+
+  if (code1 != HTTP_CODE_OK && out.length() == 0) return false;
+  if (out.length() == 0) {
+    Serial.println("Body weiterhin leer.");
+    return false;
+  }
+  return true;
+}
+
+// --- WL-Fetch: serverTime vs. timeReal[0]/[1] mit countdown-Fallback ---
+int fetchBusCountdown(){
+  if (standby) return -1; // Standby: kein Polling
+
+  ensureWifi();
+  if (WiFi.status()!=WL_CONNECTED) return -1;
+
+  // Zeitstempel fürs Log (nur Anzeige)
+  time_t now = time(nullptr);
+  struct tm *tm_ = localtime(&now);
+  char tbuf[10]; sprintf(tbuf,"%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
+
+  String url = "https://www.wienerlinien.at/ogd_realtime/monitor?rbl=" + cfg.rbl +
+               "&activateTrafficInfo=stoerungkurz&sender=" + cfg.apiKey;
+
+  // TLS-Client vorbereiten
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  if (cfg.httpsFingerprint.length() > 0) {
+    client->setFingerprint(cfg.httpsFingerprint.c_str());
+    logLine("TLS: Fingerprint-Pinning aktiv");
+  } else if (cfg.httpsInsecure) {
+    client->setInsecure();
+    logLine("TLS: INSECURE (testweise)");
   } else {
-    logLine("timeReal[0] nicht vorhanden.");
+    client->setInsecure();
+    logLine("TLS: Fallback insecure (kein Fingerprint gesetzt)");
   }
+  client->setBufferSizes(2048, 2048);          // größere TLS-Buffer helfen bei stabilen Reads
+  client->setX509Time(time(nullptr));          // korrekte TLS-Zeit
 
-  if(bestSec < 0){
-    // Fallback countdown (Minuten)
-    const String needle="\"countdown\":";
-    int k = payload.indexOf(needle);
-    if(k>=0){
-      int s=k+needle.length();
-      while(s<(int)payload.length() && (payload[s]==' '||payload[s]=='\t')) s++;
-      int e=s; while(e<(int)payload.length() && isdigit(payload[e])) e++;
-      if(e>s){
-        int cdMin = payload.substring(s,e).toInt();
-        bestSec = cdMin*60;
-        logLine(String("Fallback countdown(min): ")+String(cdMin)+" => "+String(bestSec)+"s");
-      }
+  logLine("[" + String(tbuf) + "] GET " + url);
+
+  // HTTP holen (robust)
+  String payload;
+  if (!httpGetJson(url, payload, *client)) {
+    if (payload.length() > 0) {
+      if (payload.length() > 16384) payload.remove(16384);
+      lastPayload = payload;
     }
-  }
-
-  if(bestSec < 0){
-    logLine("Kein gültiger Zeitpunkt gefunden.");
     return -1;
   }
 
-  secondsToBus = bestSec;
+  // Payload für UI kürzen & speichern
+  if (payload.length() > 16384) payload.remove(16384);
+  lastPayload = payload;
+
+  // ---- 1) serverTime extrahieren ----
+  String serverIso; int p=0;
+  if (!scanQuotedAfter(payload, 0, "\"serverTime\":\"", serverIso, p)) {
+    logLine("serverTime nicht gefunden – Abbruch");
+    return -1;
+  }
+  time_t tServer = parseISO8601_UTC_to_epoch(serverIso);
+  Serial.println(String("serverTime: ") + serverIso + " → epoch=" + String((uint32_t)tServer));
+  timeSynced = true; // wir verwenden serverTime als Referenz
+
+  // ---- 2) erste(n) timeReal + ggf. nearby countdowns einsammeln ----
+  struct Hit { String iso; int countdown; };
+  Hit hits[4]; int hitCount = 0;
+  int pos = 0;
+  while (hitCount < 4) {
+    String iso; int nextPos=0;
+    if (!scanQuotedAfter(payload, pos, "\"timeReal\":\"", iso, nextPos)) break;
+
+    // Versuche, einen direkt folgenden countdown im gleichen JSON-Block zu finden.
+    int cd = -1, dummy = 0;
+    int searchFrom = nextPos;
+    int searchTo   = min((int)payload.length(), searchFrom + 220); // kleines Fenster nach vorne
+    String window  = payload.substring(searchFrom, searchTo);
+    if (scanIntAfter(window, 0, "\"countdown\":", cd, dummy)) {
+      // ok
+    }
+
+    hits[hitCount++] = { iso, cd };
+    pos = nextPos;
+  }
+
+  if (hitCount == 0) {
+    logLine("timeReal nicht gefunden – Abbruch");
+    return -1;
+  }
+
+  // ---- 3) timeReal[0] verwenden; wenn negativ → countdown-Fallback; sonst timeReal[1] ----
+  auto evalHit = [&](const Hit& h, int idx)->int {
+    time_t tDep = parseISO8601_UTC_to_epoch(h.iso);
+    long diff = (long)tDep - (long)tServer;
+    Serial.println(String("timeReal[") + idx + "]: " + h.iso +
+                   " → diff=" + String(diff) + "s, fallbackCountdown=" + String(h.countdown));
+    if (diff >= 0) return (int)diff;
+    if (h.countdown >= 0) {
+      Serial.println(String("timeReal[") + idx + "] negativ → nutze countdown=" + String(h.countdown));
+      return h.countdown;
+    }
+    return -1;
+  };
+
+  int best = evalHit(hits[0], 0);
+  if (best < 0 && hitCount >= 2) {
+    Serial.println("timeReal[0] negativ → versuche timeReal[1] …");
+    best = evalHit(hits[1], 1);
+  }
+
+  if (best < 0) {
+    logLine("Weder timeReal[0] noch [1] ergeben gültigen Wert – Abbruch");
+    return -1;
+  }
+
+  // Ergebnis übernehmen
+  secondsToBus = best;
   lastUpdateMs = millis();
 
-  int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-  logLine(String("--- Countdown: ")+String(secondsToBus)+" sec ("+mmss+") ---");
+  int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss, "%02d:%02d", mm, ss);
+  logLine(String("--- Countdown (serverTime vs timeReal): ") + String(secondsToBus) + " sec (" + mmss + ") ---");
   return secondsToBus;
 }
 
@@ -894,7 +945,7 @@ void handleStatus(){
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
-  doc["secondsToBus"] = (!standby) ? secondsToBus : 0;
+  doc["secondsToBus"] = (timeSynced && !standby) ? secondsToBus : 0;
   doc["lastUpdateMs"] = lastUpdateMs;
   doc["timeSynced"] = timeSynced;
   doc["now"] = (uint32_t) time(nullptr);
@@ -923,27 +974,37 @@ void handleStatus(){
   String out; serializeJson(doc,out);
   server.send(200,"application/json", out);
 }
-
 void handleLastPayload(){ server.send(200, lastPayload.length()? "application/json":"text/plain", lastPayload); }
 
 void handleConfigPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<1024> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
-  if(doc["ssid"].is<const char*>()) cfg.ssid = doc["ssid"].as<const char*>();
-  if(doc["password"].is<const char*>()) cfg.password = doc["password"].as<const char*>();
-  if(doc["apiKey"].is<const char*>()) cfg.apiKey = doc["apiKey"].as<const char*>();
-  if(doc["rbl"].is<const char*>()) cfg.rbl = doc["rbl"].as<const char*>();
-  if(doc["tz"].is<const char*>()) cfg.tz = doc["tz"].as<const char*>();
-  if(doc["httpsInsecure"].is<bool>()) cfg.httpsInsecure = doc["httpsInsecure"].as<bool>();
+
+  StaticJsonDocument<1024> doc;
+  if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+
+  if(doc["ssid"].is<const char*>())        cfg.ssid = doc["ssid"].as<const char*>();
+  if(doc["password"].is<const char*>())    cfg.password = doc["password"].as<const char*>();
+  if(doc["apiKey"].is<const char*>())      cfg.apiKey = doc["apiKey"].as<const char*>();
+  if(doc["rbl"].is<const char*>())         cfg.rbl = doc["rbl"].as<const char*>();
+  if(doc["httpsInsecure"].is<bool>())      cfg.httpsInsecure = doc["httpsInsecure"].as<bool>();
   if(doc["httpsFingerprint"].is<const char*>()) cfg.httpsFingerprint = doc["httpsFingerprint"].as<const char*>();
+
   Serial.println("---Werte aus Webformular übernommen---");
   Serial.println("SSID: " + cfg.ssid);
   Serial.println("Passwort: " + cfg.password);
   Serial.println("API-Key: " + cfg.apiKey);
   Serial.println("RBL: " + cfg.rbl);
-  saveConfig();
-  server.send(200,"text/html","Daten gespeichert. Neustart...");
-  delay(500); ESP.restart();
+
+  bool ok = saveConfig();
+  if(!ok){
+    server.send(500,"text/plain","Speichern fehlgeschlagen (siehe Serial-Log)");
+    return;
+  }
+
+  // Kurze Pause vor dem Neustart, damit der Flash wirklich durch ist
+  server.send(200,"text/html","Daten gespeichert. Neustart…");
+  delay(500);
+  ESP.restart();
 }
 
 void handleLedPost(){
@@ -1008,12 +1069,47 @@ void handleStandbyPost(){
 }
 
 void handleFetchNow(){
-  int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; }
+  int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; backoffMs=20000; }
   int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
   String out=String("{\"ok\":")+(s>=0?"true":"false")+",\"seconds\":"+(s>=0?String(s):"-1")+",\"mmss\":\""+String(mmss)+"\"}";
   server.send(200,"application/json",out);
 }
+
 void handleFactoryReset(){ LittleFS.remove("/config.json"); server.send(200,"application/json","{\"ok\":true,\"note\":\"config removed; rebooting\"}"); delay(250); ESP.restart(); }
+
+void handleFsFormat(){
+  if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false,\"error\":\"Missing body\"}"); return; }
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400,"application/json","{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  const char* confirm = doc["confirm"] | "";
+  if (String(confirm) != "FORMAT") {
+    server.send(403,"application/json","{\"ok\":false,\"error\":\"Confirmation token required\"}");
+    return;
+  }
+
+  size_t total=0, used=0;
+  if (fsInfo(total, used)) {
+    Serial.println("FS-Format START: used="+String(used)+" / total="+String(total));
+  }
+
+  LittleFS.end();
+  bool okFmt = LittleFS.format();
+  bool okMount = LittleFS.begin();
+
+  if (okFmt && okMount) {
+    Serial.println("FS-Format OK → reboot");
+    server.send(200,"application/json","{\"ok\":true}");
+    delay(300);
+    ESP.restart();
+  } else {
+    Serial.println(String("FS-Format FAILED: format=")+(okFmt?"true":"false")+", mount="+(okMount?"true":"false"));
+    server.send(500,"application/json", String("{\"ok\":false,\"error\":\"format=") + (okFmt?"true":"false") + ", mount=" + (okMount?"true":"false") + "\"}");
+  }
+}
+
 void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sendHeader("Access-Control-Allow-Headers","Content-Type"); server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS"); }
 
 // ---------- Setup/Loop ----------
@@ -1021,7 +1117,7 @@ void setup(){
   Serial.begin(115200); delay(200); Serial.println(); Serial.println("Booting… F_CPU="+String(F_CPU));
 
   strip.begin(); strip.setBrightness(cfg.brightness); strip.show();
-
+  ensureFS();         // <— wichtig
   if(!LittleFS.begin()){ logLine("LittleFS mount failed"); }
   loadConfig();
 
@@ -1031,7 +1127,7 @@ void setup(){
     logLine("Web-Konfiguration auf http://192.168.4.1/");
   } else { WiFi.mode(WIFI_STA); ensureWifi(); }
 
-  ensureTime(); // best effort (nur für Status)
+  ensureTime(); // best effort
 
   ArduinoOTA.setHostname("wldisplay"); ArduinoOTA.begin(); logLine("OTA bereit (Hostname: wldisplay)");
   if(MDNS.begin("wldisplay")) logLine("mDNS aktiv: http://wldisplay.local");
@@ -1047,6 +1143,7 @@ void setup(){
   server.on("/api/fetch-now",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/factoryreset",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/standby",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
+  server.on("/api/fs-format",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
 
   server.on("/api/config", HTTP_POST, [](){ addCORS(); handleConfigPost(); });
   server.on("/api/led", HTTP_POST, [](){ addCORS(); handleLedPost(); });
@@ -1054,6 +1151,7 @@ void setup(){
   server.on("/api/fetch-now", HTTP_POST, [](){ addCORS(); handleFetchNow(); });
   server.on("/api/factoryreset", HTTP_POST, [](){ addCORS(); handleFactoryReset(); });
   server.on("/api/standby", HTTP_POST, [](){ addCORS(); handleStandbyPost(); });
+  server.on("/api/fs-format", HTTP_POST, [](){ addCORS(); handleFsFormat(); });
 
   server.on("/status-log", HTTP_GET, [](){ addCORS(); server.send(200,"text/plain", ringLog); });
 
@@ -1082,17 +1180,28 @@ void loop(){
     } else displayClear();
   }
 
-  // Poll WL – NEU: einfache Regel (200+Body => 20s; sonst 5s)
-  if(!standby && millis() >= nextPollAt){
-    int s = fetchBusCountdown();
-    if(s>=0) secondsToBus=s;
+// Poll WL
+if (!standby && millis() >= nextPollAt) {
+  int s = fetchBusCountdown();
 
-    backoffMs = lastFetchHadContent ? 20000UL : 5000UL;
-    nextPollAt = millis() + backoffMs;
-
-    int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-    Serial.println("Next poll in " + String(backoffMs) + " ms; seconds=" + String(secondsToBus) + " (" + String(mmss) + ")");
+  if (s >= 0) {
+    // Erfolg mit valider Antwort
+    secondsToBus = s;
+    backoffMs = 20000; // 20s bei Erfolg
+  } else {
+    // Fehler ODER leerer Body
+    backoffMs = 5000;  // 5s bei Fehler
   }
+
+  nextPollAt = millis() + backoffMs;
+
+  int mm = secondsToBus / 60, ss = secondsToBus % 60;
+  char mmss[6]; sprintf(mmss, "%02d:%02d", mm, ss);
+  Serial.println("Next poll in " + String(backoffMs) + " ms; seconds=" +
+                 String(secondsToBus) + " (" + String(mmss) + ")");
+}
+
+
 
   yield();
 }
