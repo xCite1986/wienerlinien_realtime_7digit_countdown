@@ -1,17 +1,19 @@
 /*
   Wiener Linien Countdown + NeoPixel 7-Segment mit REST-API
-  - Mobil-optimierte Setup-/Status-Seite auf /
+  - Web UI (mobil-optimiert) auf /
     * Formular (SSID/Passwort/RBL/API-Key)
     * Live-Countdown (MM:SS), farbig wie LEDs
-    * Logfenster mit letzter WL-JSON-Antwort
+    * Logfenster (letzte WL-JSON-Antwort, gekürzt)
     * LED-Steuerung: Power, Brightness, 3 Farben + 2 Schwellwerte
     * Standby-Button (LEDs AUS + Polling pausiert)
-  - Countdown-Berechnung NUR: time(dep) - time(now) (niemals API 'countdown')
-  - Robust: stromorientierte JSON-Suche über alle timeReal/Planned (keine TooDeep)
-  - NTP-Racefix (timeSynced): es wird erst nach Zeit-Sync gerechnet
-  - Serial-Logs inkl. Sekunden & MM:SS
-  - HTTPS: Fingerprint optional; sonst setInsecure()
-  - OTA + mDNS, LittleFS
+  - Berechnung:
+    * serverTime (aus JSON) als "Jetzt"
+    * Nimm timeReal[0]; wenn diff < 0 => nimm timeReal[1]
+    * Falls keine timeReal verfügbar ⇒ nimm countdown (Minuten) als Fallback
+    * Niemals "countdown" bevorzugen, nur Fallback
+  - Robust: reine Stringsuche (kein Deserialization/TooDeep)
+  - Poll-Logik: 200 + Body => 20s; sonst 5s
+  - OTA + mDNS, LittleFS; HTTPS optional mit Fingerprint (sonst insecure)
 */
 
 #include <ESP8266WiFi.h>
@@ -22,7 +24,7 @@
 #include <ArduinoOTA.h>
 #include <Adafruit_NeoPixel.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>
+#include <ArduinoJson.h>   // nur für Konfig speichern/lesen
 #include <time.h>
 
 // ---------- Hardware ----------
@@ -51,12 +53,12 @@ struct AppConfig {
 
   // Farbe & Schwellen (Sekunden)
   uint16_t tLow = 30;       // < tLow  => lowColor
-  uint16_t tMid = 90;       // < tMid  => midColor ; >= tMid => highColor
+  uint16_t tMid = 90;       // < tMid  => midColor; >= tMid => highColor
   uint8_t  colLow[3]  = {255, 0,   0};   // rot
   uint8_t  colMid[3]  = {255, 180, 0};   // gelb
   uint8_t  colHigh[3] = {0,   255, 0};   // grün
 
-  // HTTPS / Zeitzone
+  // HTTPS / Zeitzone (TZ nur für Systemzeit im Status/Fallback)
   bool httpsInsecure = false;
   String httpsFingerprint = "";
   String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
@@ -64,7 +66,7 @@ struct AppConfig {
 
 String lastDisplayValue = "----";
 String ringLog;
-String lastPayload;                 // volle letzte API-JSON (gekürzt)
+String lastPayload;                 // volle letzte API-JSON (ggf. gekürzt)
 unsigned long lastUpdateMs = 0;     // millis() der letzten erfolgreichen Abfrage
 int secondsToBus = 0;
 bool blinkState = false;
@@ -73,9 +75,12 @@ unsigned long nextPollAt = 0;
 unsigned long nextTickAt = 0;
 unsigned long backoffMs = 20000;
 
-bool timeSynced = false;
+bool timeSynced = false;            // Systemzeit via NTP (nur für Status/Notfall)
 bool standby = false;               // Standby: LEDs aus & Polling pausiert
 const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
+
+// Poll-Steuerung (neu): 200+Body => true; sonst false
+bool lastFetchHadContent = false;
 
 // ---------- 7-Segment Mapping ----------
 const uint8_t digitSegmentMap[4][14] PROGMEM = {
@@ -203,8 +208,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 
   // ---- State ----
   let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
-  let thresholds = {low:30, mid:90};
-  let colors = { low:[255,0,0], mid:[255,180,0], high:[0,255,0] };
   let standby = false;
 
   function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
@@ -235,12 +238,9 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   }
   $('#powerBtn').addEventListener('click', ()=>{
     const on = $('#powerBtn').dataset.state!=='off';
-    postLed({
-      power: !on,
-      brightness: +$('#brightRange').value,
+    postLed({ power: !on, brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
-    });
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)} });
   });
   $('#standbyBtn').addEventListener('click', async ()=>{
     try{
@@ -254,25 +254,11 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
   $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
 
-  // Farben/Schwellen sofortige Vorschau (Serverfarbe bleibt maßgeblich)
-  const previewHooks = ['tLow','tMid','cLow','cMid','cHigh'];
-  previewHooks.forEach(id=>{
-    $('#'+id).addEventListener('input', ()=>{
-      thresholds.low = +$('#tLow').value || thresholds.low;
-      thresholds.mid = +$('#tMid').value || thresholds.mid;
-      colors.low  = hex2rgb($('#cLow').value);
-      colors.mid  = hex2rgb($('#cMid').value);
-      colors.high = hex2rgb($('#cHigh').value);
-    });
-  });
-
   $('#ledSave').addEventListener('click', ()=>{
-    postLed({
-      power: $('#powerBtn').dataset.state!=='off',
+    postLed({ power: $('#powerBtn').dataset.state!=='off',
       brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
-    });
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)} });
   });
 
   // Status holen & UI updaten
@@ -282,7 +268,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       if(!r.ok) throw new Error(r.status);
       const s = await r.json();
 
-      // WLAN / Zeit
       $('#ip').textContent = s.ip || '-';
       $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
       $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
@@ -292,9 +277,8 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
 
       // Countdown / Modus / Standby
-      mode = s.mode || 'countdown';
-      $('#modeBadge').textContent = 'Modus: ' + mode;
-      secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
+      $('#modeBadge').textContent = 'Modus: ' + (s.mode || 'countdown');
+      secondsRemaining = s.secondsToBus || 0;
       setStandbyBtn(!!s.standby);
 
       // LED-Settings
@@ -307,28 +291,27 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         $('#tMid').value = s.thresholds.mid ?? 90;
       }
       if (s.colors){
-        if (s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
-        if (s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
-        if (s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
+        if (s.colors.low)  document.getElementById('cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
+        if (s.colors.mid)  document.getElementById('cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
+        if (s.colors.high) document.getElementById('cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
       }
 
       // JSON-Log
       try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
 
-      syncCountdown = timeSynced ? 5 : 1;
-
       // Countdown-Farbe (vom Server geliefertes currentColor)
       setCountdownColorFromServer(s.currentColor);
+      syncCountdown = 5;
     }catch(e){ /* AP-Modus ok */ }
   }
 
   // Sekundentick
   setInterval(()=>{
-    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
+    const mmss = (secondsRemaining>0)? secondsRemaining : 0;
+    document.getElementById('countMMSS').textContent = fmt(mmss);
     if(secondsRemaining>0) secondsRemaining--;
-    $('#countMMSS').textContent = fmt(secondsRemaining);
     if(syncCountdown>0) syncCountdown--;
-    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
+    document.getElementById('nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
   }, 1000);
 
   // Status polling
@@ -343,12 +326,12 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 void logLine(const String &s) {
   Serial.println(s);
   ringLog += s; ringLog += "\n";
-  if (ringLog.length() > 6000)
-    ringLog.remove(0, ringLog.length() - 6000);
+  if (ringLog.length() > 6000) ringLog.remove(0, ringLog.length() - 6000);
 }
 
 // ISO-8601 → epoch (UTC) inkl. Offset (+hhmm / Z)
 time_t parseISO8601_UTC_to_epoch(const String& iso){
+  if(iso.length() < 20) return 0;
   int Y=iso.substring(0,4).toInt();
   int M=iso.substring(5,7).toInt();
   int D=iso.substring(8,10).toInt();
@@ -366,20 +349,60 @@ time_t parseISO8601_UTC_to_epoch(const String& iso){
     }
   }
 
-  tm t = {}; t.tm_year=Y-1900; t.tm_mon=M-1; t.tm_mday=D; t.tm_hour=h; t.tm_min=m; t.tm_sec=s;
-  char *oldtz = getenv("TZ"); setenv("TZ","UTC0",1); tzset();
+  struct tm t = {};
+  t.tm_year=Y-1900; t.tm_mon=M-1; t.tm_mday=D; t.tm_hour=h; t.tm_min=m; t.tm_sec=s;
+
+  // mktime mit UTC (TZ=UTC0)
+  char *oldtz = getenv("TZ");
+  setenv("TZ","UTC0",1); tzset();
   time_t epoch = mktime(&t);
   if (oldtz) setenv("TZ", oldtz, 1); else unsetenv("TZ"); tzset();
 
+  // Offset abziehen, um echte UTC zu bekommen
   epoch -= offSign * (offH*3600 + offMin*60);
   return epoch;
 }
 
-// sauberes ISO aus JSON-Text holen (bis zum schließenden Anführungszeichen)
-bool extractIsoAfter(const String& src, int startIdx, String& out) {
-  int end = src.indexOf('"', startIdx);
-  if (end < 0) return false;
-  out = src.substring(startIdx, end);
+// String-Helfer: erstbesten Wert nach needle holen ("\"key\":\"")
+bool findQuotedValue(const String& src, const String& needle, String& out, int startPos=0) {
+  int k = src.indexOf(needle, startPos);
+  if (k < 0) return false;
+  int sidx = k + needle.length();
+  int eidx = src.indexOf('"', sidx);
+  if (eidx < 0) return false;
+  out = src.substring(sidx, eidx);
+  return true;
+}
+
+// N-tes Auftreten von timeReal holen
+bool findTimeRealNth(const String& src, int nth, String& isoOut) {
+  const String needle = "\"timeReal\":\"";
+  int pos = 0;
+  for (int i=0;i<=nth;i++){
+    int k = src.indexOf(needle, pos);
+    if (k < 0) return false;
+    int sidx = k + needle.length();
+    int eidx = src.indexOf('"', sidx);
+    if (eidx < 0) return false;
+    isoOut = src.substring(sidx, eidx);
+    pos = eidx + 1;
+  }
+  return true;
+}
+
+// Erstes countdown-Feld (als Minuten) holen
+bool findCountdownFirst(const String& src, int &minutesOut){
+  const String needle = "\"countdown\":";
+  int k = src.indexOf(needle);
+  if (k < 0) return false;
+  int sidx = k + needle.length();
+  // überspringe evtl. Leerzeichen
+  while (sidx < (int)src.length() && (src[sidx]==' ' || src[sidx]=='\t')) sidx++;
+  // Zahl parsen
+  int e = sidx;
+  while (e < (int)src.length() && isdigit(src[e])) e++;
+  if (e == sidx) return false;
+  minutesOut = src.substring(sidx, e).toInt();
   return true;
 }
 
@@ -473,15 +496,10 @@ bool ensureTime() {
   return timeSynced;
 }
 
-// ---------- WL-Fetch (stromorientiert & robust) ----------
 int fetchBusCountdown(){
-  if (standby) return -1;         // Standby: kein Polling
+  if (standby) return -1;
   ensureWifi();
-  if (WiFi.status()!=WL_CONNECTED) return -1;
-
-  if (!timeSynced) {
-    if (!ensureTime()) { logLine("Zeit noch nicht synchron – überspringe Fetch"); return -1; }
-  }
+  if (WiFi.status()!=WL_CONNECTED) { lastFetchHadContent=false; return -1; }
 
   // Zeit fürs Log
   time_t now=time(nullptr); struct tm *tm_ = localtime(&now); char tbuf[10]; sprintf(tbuf,"%02d:%02d:%02d",tm_->tm_hour,tm_->tm_min,tm_->tm_sec);
@@ -489,64 +507,157 @@ int fetchBusCountdown(){
   String url = "https://www.wienerlinien.at/ogd_realtime/monitor?rbl="+cfg.rbl+"&activateTrafficInfo=stoerungkurz&sender="+cfg.apiKey;
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  // (Optional) etwas größere Puffer gegen TLS-Truncation
+  client->setBufferSizes(512, 4096);
+
   if(cfg.httpsFingerprint.length()>0){ client->setFingerprint(cfg.httpsFingerprint.c_str()); logLine("TLS: Fingerprint-Pinning aktiv"); }
   else if(cfg.httpsInsecure){ client->setInsecure(); logLine("TLS: INSECURE (testweise)"); }
   else { client->setInsecure(); logLine("TLS: Fallback insecure (kein Fingerprint gesetzt)"); }
 
   HTTPClient http;
-  logLine("["+String(tbuf)+"] GET "+url);
-  if(!http.begin(*client, url)){ logLine("HTTP begin failed"); return -1; }
+  http.useHTTP10(true);                         // *** WICHTIG: kein chunked ***
+  http.setTimeout(12000);                       // genug Zeit lassen
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  int code=http.GET();
-  String payload = (code>0)? http.getString() : "";
+  logLine("["+String(tbuf)+"] GET "+url);
+  if(!http.begin(*client, url)){ logLine("HTTP begin failed"); lastFetchHadContent=false; return -1; }
+
+  // Gzip abwählen & Verbindung schließen lassen
+  http.addHeader("Accept-Encoding","identity");
+  http.addHeader("Connection","close");
+  http.addHeader("User-Agent","ESP8266-WLDisplay/1.0");
+
+  int code = http.GET();
+  String payload;
+
+  if(code>0){
+    // Erst versuchen, Content-Length & direkten Read
+    int len = http.getSize();            // kann -1 sein bei unbekannter Länge
+    if(len > 0){
+      // Direkter Lese-Loop (robust)
+      WiFiClient * stream = http.getStreamPtr();
+      payload.reserve((size_t)len);
+      unsigned long deadline = millis()+12000;
+      while(http.connected() && (len > 0 || len == -1) && millis() < deadline){
+        while(stream->available()){
+          char c = (char)stream->read();
+          payload += c;
+          if(len > 0) len--;
+        }
+        if(len == 0) break;
+        delay(1); yield();
+      }
+    } else {
+      // Unbekannte Länge (oder 0): lese bis Verbindungsende
+      WiFiClient * stream = http.getStreamPtr();
+      unsigned long deadline = millis()+12000;
+      while(stream->connected() && millis()<deadline){
+        while(stream->available()){
+          payload += (char)stream->read();
+        }
+        // wenn kurz nichts kommt, kleine Pause
+        delay(1); yield();
+      }
+    }
+  }
+
   http.end();
 
-  logLine("HTTP Code: "+String(code));
-  if(payload.length()>0){
-    if(payload.length()>16384) payload.remove(16384); // limitieren
-    lastPayload = payload;
-    size_t cutlen = payload.length()<1200? payload.length(): 1200;
-    logLine("["+String(tbuf)+"] API Payload (cut):");
-    logLine(payload.substring(0,cutlen)); if(payload.length()>cutlen) logLine("...");
-  }
-  if(code!=HTTP_CODE_OK) return -1;
+  // Erfolg/Fehler fürs Re-Polling merken
+  lastFetchHadContent = (code==200 && payload.length()>0);
 
-  // ---- Stromorientierte Suche: früheste zukünftige timeReal, sonst timePlanned ----
-  auto scanNext = [&](const char* key)->int {
-    int best = -1;
-    int pos = 0;
-    const String needle = String("\"") + key + "\":\"";  // z.B. "timeReal":"
-    while (true) {
-      int k = payload.indexOf(needle, pos);
-      if (k < 0) break;
-      int sidx = k + needle.length();
-      int eidx = payload.indexOf('"', sidx);
-      if (eidx < 0) break;
-      String iso = payload.substring(sidx, eidx);
-      time_t tDep = parseISO8601_UTC_to_epoch(iso);
-      long diff = (long)tDep - (long)time(nullptr);
-      if (diff >= 0 && (best < 0 || diff < best)) best = (int)diff;
-      pos = eidx + 1;
-      if (pos > 16000) break; // Sicherheitsbremse
+  // Serial-Log + lastPayload (gekürzt)
+  if(code==200) logLine("HTTP Code: 200");
+  else          logLine("HTTP Code: "+String(code));
+
+  if(payload.length()>0){
+    String vis = payload; vis.replace("\r","");
+    if(vis.length()>16384) vis.remove(16384);
+    lastPayload = vis;
+    size_t cut = vis.length()<1200? vis.length(): 1200;
+    logLine("["+String(tbuf)+"] API Payload (cut):");
+    if (cut) logLine(vis.substring(0,cut));
+    if (vis.length()>cut) logLine("...");
+  } else {
+    logLine("Body ist leer – Abbruch.");
+    return -1; // **wichtig**: keine Auswertung ohne Body
+  }
+
+  // ---- serverTime holen ----
+  String sServerIso;
+  if(payload.indexOf("\"serverTime\":\"")>=0){
+    int s = payload.indexOf("\"serverTime\":\"") + 14;
+    int e = payload.indexOf('"', s);
+    if(e> s) sServerIso = payload.substring(s,e);
+  }
+  time_t serverNow = sServerIso.length() ? parseISO8601_UTC_to_epoch(sServerIso) : time(nullptr);
+
+  // ---- timeReal[0] bzw. [1] ----
+  auto getNth = [&](int nth)->String{
+    const String needle="\"timeReal\":\"";
+    int pos=0;
+    for(int i=0;i<=nth;i++){
+      int k = payload.indexOf(needle,pos);
+      if(k<0) return String();
+      int s=k+needle.length(); int e=payload.indexOf('"',s);
+      if(e<0) return String();
+      String iso = payload.substring(s,e);
+      pos=e+1;
+      return (i==nth)? iso : String(); // return only when i==nth
     }
-    return best;
+    return String();
   };
 
-  int diff = scanNext("timeReal");
-  if (diff < 0) diff = scanNext("timePlanned");  // Fallback
+  String iso0 = getNth(0);
+  int bestSec = -1;
+  if(iso0.length()){
+    long d0 = (long)parseISO8601_UTC_to_epoch(iso0) - (long)serverNow;
+    if(d0>=0){
+      bestSec = (int)d0;
+      logLine(String("timeReal[0]: ")+iso0+"  Δ="+String(bestSec)+"s");
+    } else {
+      String iso1 = getNth(1);
+      if(iso1.length()){
+        long d1 = (long)parseISO8601_UTC_to_epoch(iso1) - (long)serverNow;
+        logLine(String("timeReal[0] negativ (Δ=")+String(d0)+"), nehme timeReal[1]: "+iso1+"  Δ="+String(d1)+"s");
+        if(d1>=0) bestSec=(int)d1;
+      } else {
+        logLine("timeReal[1] nicht vorhanden.");
+      }
+    }
+  } else {
+    logLine("timeReal[0] nicht vorhanden.");
+  }
 
-  if (diff < 0) {
-    logLine("Kein gültiger Zeitpunkt im JSON gefunden.");
+  if(bestSec < 0){
+    // Fallback countdown (Minuten)
+    const String needle="\"countdown\":";
+    int k = payload.indexOf(needle);
+    if(k>=0){
+      int s=k+needle.length();
+      while(s<(int)payload.length() && (payload[s]==' '||payload[s]=='\t')) s++;
+      int e=s; while(e<(int)payload.length() && isdigit(payload[e])) e++;
+      if(e>s){
+        int cdMin = payload.substring(s,e).toInt();
+        bestSec = cdMin*60;
+        logLine(String("Fallback countdown(min): ")+String(cdMin)+" => "+String(bestSec)+"s");
+      }
+    }
+  }
+
+  if(bestSec < 0){
+    logLine("Kein gültiger Zeitpunkt gefunden.");
     return -1;
   }
 
-  secondsToBus = diff;
+  secondsToBus = bestSec;
   lastUpdateMs = millis();
 
   int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-  logLine(String("--- Countdown (stream-scan): ")+String(secondsToBus)+" sec ("+mmss+") ---");
+  logLine(String("--- Countdown: ")+String(secondsToBus)+" sec ("+mmss+") ---");
   return secondsToBus;
 }
+
 
 // ---------- Anzeige-States ----------
 enum class DisplayMode : uint8_t { COUNTDOWN, OFF, MINUS, STANDBY };
@@ -572,7 +683,7 @@ void handleStatus(){
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
-  doc["secondsToBus"] = (timeSynced && !standby) ? secondsToBus : 0;
+  doc["secondsToBus"] = (!standby) ? secondsToBus : 0;
   doc["lastUpdateMs"] = lastUpdateMs;
   doc["timeSynced"] = timeSynced;
   doc["now"] = (uint32_t) time(nullptr);
@@ -601,6 +712,7 @@ void handleStatus(){
   String out; serializeJson(doc,out);
   server.send(200,"application/json", out);
 }
+
 void handleLastPayload(){ server.send(200, lastPayload.length()? "application/json":"text/plain", lastPayload); }
 
 void handleConfigPost(){
@@ -685,7 +797,7 @@ void handleStandbyPost(){
 }
 
 void handleFetchNow(){
-  int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; backoffMs=20000; }
+  int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; }
   int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
   String out=String("{\"ok\":")+(s>=0?"true":"false")+",\"seconds\":"+(s>=0?String(s):"-1")+",\"mmss\":\""+String(mmss)+"\"}";
   server.send(200,"application/json",out);
@@ -708,7 +820,7 @@ void setup(){
     logLine("Web-Konfiguration auf http://192.168.4.1/");
   } else { WiFi.mode(WIFI_STA); ensureWifi(); }
 
-  ensureTime(); // best effort
+  ensureTime(); // best effort (nur für Status)
 
   ArduinoOTA.setHostname("wldisplay"); ArduinoOTA.begin(); logLine("OTA bereit (Hostname: wldisplay)");
   if(MDNS.begin("wldisplay")) logLine("mDNS aktiv: http://wldisplay.local");
@@ -759,21 +871,16 @@ void loop(){
     } else displayClear();
   }
 
-  // Poll WL
+  // Poll WL – NEU: einfache Regel (200+Body => 20s; sonst 5s)
   if(!standby && millis() >= nextPollAt){
     int s = fetchBusCountdown();
-    if(s>=0){
-      secondsToBus=s;
-      // sehr schnelles Re-Polling, wenn Abfahrt quasi jetzt ist
-      if (secondsToBus <= 3) backoffMs = 3000;   // 3s
-      else                   backoffMs = 20000;  // 20s
-    } else {
-      backoffMs = backoffMs*2; if(backoffMs>300000UL) backoffMs=300000UL; // bis 5 min
-    }
-    nextPollAt = millis() + (timeSynced ? backoffMs : 2000);
+    if(s>=0) secondsToBus=s;
+
+    backoffMs = lastFetchHadContent ? 20000UL : 5000UL;
+    nextPollAt = millis() + backoffMs;
 
     int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
-    Serial.println("Next poll in " + String(timeSynced ? backoffMs : 2000) + " ms; seconds=" + String(secondsToBus) + " (" + String(mmss) + ")");
+    Serial.println("Next poll in " + String(backoffMs) + " ms; seconds=" + String(secondsToBus) + " (" + String(mmss) + ")");
   }
 
   yield();
