@@ -97,57 +97,98 @@ const uint8_t digitPatterns[10][7] PROGMEM = {
 // ---------- HTML ----------
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="de"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>WL Display</title>
 <style>
-:root{--bg:#0b0f14;--card:#121821;--ink:#eaf2ff;--dim:#a9b7cf;--accent:#3aa6ff;--ok:#7ad96b;--warn:#f5c06a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+:root{
+  --bg:#0b0f14;--card:#121821;--ink:#eaf2ff;--dim:#a9b7cf;--accent:#3aa6ff;
+  --ok:#7ad96b;--warn:#f5c06a;--line:#1f2a38;--field:#0e1420
+}
+*{box-sizing:border-box}
+html,body{background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0}
 .wrap{max-width:1100px;margin:0 auto;padding:20px}
 .grid{display:grid;gap:16px}
 @media(min-width:900px){.grid-2{grid-template-columns:1fr 1fr}}
-.card{background:linear-gradient(180deg,#131a24,#0f1520);border:1px solid #1f2a38;border-radius:16px;padding:clamp(14px,2.5vw,22px);box-shadow:0 10px 30px rgba(0,0,0,.35)}
-h1{margin:0 0 6px;font-size:clamp(18px,4.5vw,24px)} p.lead{margin:0 0 14px;color:var(--dim)}
+.card{
+  background:linear-gradient(180deg,#131a24,#0f1520);
+  border:1px solid var(--line);border-radius:16px;padding:clamp(14px,2.5vw,22px);
+  box-shadow:0 10px 30px rgba(0,0,0,.35)
+}
+h1{margin:0 0 6px;font-size:clamp(18px,4.5vw,24px)}
+p.lead{margin:0 0 14px;color:var(--dim)}
 label{font-size:13px;color:var(--dim);display:block;margin-bottom:6px}
-input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid #253245;background:#0e1420;color:var(--ink);font-size:16px}
+input,textarea,select{
+  width:100%;padding:12px;border-radius:12px;border:1px solid #253245;
+  background:var(--field);color:var(--ink);font-size:16px
+}
 input[type=range]{padding:0;height:36px}
 textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px rgba(58,166,255,.15)}
 .row{display:grid;gap:10px}
 .row-2{display:grid;gap:10px;grid-template-columns:1fr 1fr}
-.btn{display:inline-flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#2a67ff,#154eff);color:#fff;border:none;
-     padding:12px 16px;border-radius:12px;font-weight:600;cursor:pointer}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  background:linear-gradient(180deg,#2a67ff,#154eff);color:#fff;border:none;
+  padding:12px 16px;border-radius:12px;font-weight:600;cursor:pointer
+}
 .btn.secondary{background:linear-gradient(180deg,#2b3548,#1d2535);border:1px solid #2a3648}
 .btn.warn{background:linear-gradient(180deg,#6f6b2a,#5a501b)}
 .kv{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:13px}
-.kv b{color:var(--ink)} .count{font-weight:800;font-size:clamp(36px,12vw,64px);letter-spacing:.04em}
+.kv b{color:var(--ink)}
+.count{font-weight:800;font-size:clamp(40px,10vw,72px);letter-spacing:.04em;line-height:1.1}
 .badge{display:inline-block;border-radius:999px;padding:6px 10px;font-size:12px;border:1px solid #2a3648;color:var(--dim)}
-.flex{display:flex;gap:12px;flex-wrap:wrap}
+.flex{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.pill{padding:8px 12px;border-radius:999px;border:1px solid #2a3648;background:var(--field)}
 .toast{position:fixed;left:12px;right:12px;bottom:12px;padding:14px;border-radius:12px;background:#132a17;color:#d5ffd0;border:1px solid #265c2c;display:none}
 .toast.err{background:#3a1114;color:#ffd7db;border-color:#7d262c}
+
+/* --- Color rows with thick preview bars --- */
+.color-row{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:12px;align-items:center}
+@media(max-width:600px){.color-row{grid-template-columns:1fr}}
+.preview{
+  width:100%;height:18px;border-radius:999px;border:1px solid #2a3648;
+  background:#1116; position:relative; overflow:hidden
+}
+.preview::after{
+  content:""; position:absolute; inset:0; background:var(--bar,#fff);
+}
+.swatch{
+  display:flex;align-items:center;gap:10px
+}
+.swatch input[type=color]{
+  width:44px;height:32px;border-radius:8px;padding:0;border:1px solid #2a3648;background:#000
+}
 .small{font-size:12px;color:var(--dim)}
-.warn{border-color:#6a5b2a;color:#f1da9a}
-.pill{padding:10px 14px;border-radius:999px;border:1px solid #2a3648;background:#0e1420}
-</style></head><body>
+</style>
+</head>
+<body>
 <div class="wrap grid grid-2">
+
+  <!-- Setup -->
   <div class="card">
     <h1>WL Display – Setup</h1>
-    <p class="lead">Verbinde das Gerät mit deinem WLAN und hinterlege RBL & API-Key.</p>
+    <p class="lead">Verbinde das Gerät mit deinem WLAN und hinterlege RBL &amp; API-Key.</p>
     <div class="grid" style="gap:12px">
       <div class="row"><label for="ssid">WLAN-SSID</label><input id="ssid" placeholder="MeinWLAN"></div>
       <div class="row"><label for="pwd">WLAN-Passwort</label><input id="pwd" type="password" placeholder="••••••••"></div>
       <div class="row"><label for="rbl">RBL</label><input id="rbl" inputmode="numeric" placeholder="z. B. 1184"></div>
       <div class="row"><label for="apikey">Wiener Linien API-Key</label><input id="apikey" placeholder="DEIN_API_KEY"></div>
       <div class="flex">
-        <button class="btn" id="saveBtn">Speichern & neu starten</button>
+        <button class="btn" id="saveBtn">Speichern &amp; neu starten</button>
         <button class="btn secondary" id="statusBtn">Status</button>
       </div>
-      <div class="kv"><span>IP: <b id="ip">-</b></span><span>RSSI: <b id="rssi">-</b></span>
+      <div class="kv">
+        <span>IP: <b id="ip">-</b></span>
+        <span>RSSI: <b id="rssi">-</b></span>
         <span class="badge" id="wlstate">WLAN: unbekannt</span>
-        <span class="badge warn" id="timesync">Zeit: unbekannt</span></div>
+        <span class="badge" id="timesync">Zeit: unbekannt</span>
+      </div>
       <p class="small">Erreichbar über <code>http://wldisplay.local</code> oder die zugewiesene IP.</p>
     </div>
   </div>
 
+  <!-- Live -->
   <div class="card">
     <h1>Live-Anzeige</h1>
     <p class="lead">Dieser Countdown spiegelt die 7-Segment Anzeige (MM:SS).</p>
@@ -156,6 +197,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <span class="badge" id="modeBadge">Modus: countdown</span>
       <span class="badge" id="nextSync">Sync in: -</span>
       <span class="badge" id="standbyBadge">Standby: aus</span>
+      <span class="badge" id="colorBadge"><span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:#eaf2ff;margin-right:6px;vertical-align:-1px"></span>Farbe</span>
     </div>
     <div class="row" style="margin-top:12px">
       <label for="log">Letzte WL-JSON-Antwort</label>
@@ -163,15 +205,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     </div>
   </div>
 
+  <!-- LED & Farben -->
   <div class="card" style="grid-column:1 / -1">
-    <h1>LED & Farben</h1>
+    <h1>LED &amp; Farben</h1>
     <p class="lead">Leistung und Farben abhängig von der verbleibenden Zeit.</p>
-    <div class="flex" style="align-items:center;flex-wrap:wrap">
+
+    <div class="flex">
       <button class="btn" id="powerBtn">LED: an</button>
       <button class="btn warn" id="standbyBtn">Standby: aus</button>
       <div class="pill">Helligkeit: <b id="brightVal">0</b></div>
     </div>
-    <input id="brightRange" type="range" min="0" max="255" step="1" value="40" />
+    <input id="brightRange" type="range" min="0" max="255" step="1" value="40"/>
+
     <div class="row-2" style="margin-top:10px">
       <div class="row">
         <label>Rot unter (Sekunden)</label>
@@ -182,13 +227,35 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         <input id="tMid" type="number" min="0" max="3600" step="1" placeholder="90">
       </div>
     </div>
-    <div class="row-2" style="margin-top:10px">
-      <div class="row"><label>Farbe: Rot-Bereich</label><input id="cLow" type="color" value="#ff0000"></div>
-      <div class="row"><label>Farbe: Gelb-Bereich</label><input id="cMid" type="color" value="#ffb400"></div>
+
+    <div class="row" style="margin-top:6px">
+      <div class="color-row">
+        <div class="swatch">
+          <label for="cLow" style="margin:0">Farbe: Rot-Bereich</label>
+          <input id="cLow" type="color" value="#ff0000">
+        </div>
+        <div class="preview" id="pLow"></div>
+      </div>
     </div>
-    <div class="row" style="margin-top:10px">
-      <label>Farbe: Grün-Bereich</label><input id="cHigh" type="color" value="#00ff00">
+    <div class="row" style="margin-top:6px">
+      <div class="color-row">
+        <div class="swatch">
+          <label for="cMid" style="margin:0">Farbe: Gelb-Bereich</label>
+          <input id="cMid" type="color" value="#ffb400">
+        </div>
+        <div class="preview" id="pMid"></div>
+      </div>
     </div>
+    <div class="row" style="margin-top:6px">
+      <div class="color-row">
+        <div class="swatch">
+          <label for="cHigh" style="margin:0">Farbe: Grün-Bereich</label>
+          <input id="cHigh" type="color" value="#00ff00">
+        </div>
+        <div class="preview" id="pHigh"></div>
+      </div>
+    </div>
+
     <div class="flex" style="margin-top:12px">
       <button class="btn" id="ledSave">LED-Einstellungen speichern</button>
       <span class="badge" id="previewInfo">Vorschau entspricht Live-Countdown</span>
@@ -201,20 +268,25 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 <script>
 (() => {
   const $ = s => document.querySelector(s);
-  const toast = (m, ok=true) => { const t=$('#toast'); t.textContent=m; t.className='toast'+(ok?'':' err'); t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); };
+  const toast = (m, ok=true) => { const t=$('#toast'); t.textContent=m; t.className='toast'+(ok?'':' err'); t.style.display='block'; setTimeout(()=>t.style.display='none', 3000); };
   const hex2rgb = h => { const x=h.replace('#',''); return [parseInt(x.slice(0,2),16),parseInt(x.slice(2,4),16),parseInt(x.slice(4,6),16)]; };
   const rgb2hex = (r,g,b) => '#'+[r,g,b].map(v=>('0'+v.toString(16)).slice(-2)).join('');
   const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
 
+  // --- Color preview helpers ---
+  const setPreview = (el, hex) => { el.style.setProperty('--bar', hex); };
+  const updateAllPreviews = () => { setPreview($('#pLow'), $('#cLow').value); setPreview($('#pMid'), $('#cMid').value); setPreview($('#pHigh'), $('#cHigh').value); };
+
   // ---- State ----
-  let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
-  let standby = false;
+  let secondsRemaining = 0, mode='countdown', syncCountdown=0, timeSynced=false;
+  let standby=false;
 
   function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
   function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
   function setCountdownColorFromServer(col){
-    if(!col || col.length<3){ $('#countMMSS').style.color=''; return; }
-    $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
+    const el = $('#countMMSS'); const badge = $('#colorBadge').firstElementChild;
+    if(!col || col.length<3){ el.style.color=''; badge.style.background='#eaf2ff'; return; }
+    const hx = rgb2hex(col[0], col[1], col[2]); el.style.color=hx; badge.style.background=hx;
   }
 
   // Setup speichern
@@ -223,7 +295,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
     try{
       const res = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password,rbl,apiKey})});
-      if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(), 3000); } else { toast('Fehler beim Speichern ('+res.status+')', false); }
+      if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(), 2500); } else { toast('Fehler beim Speichern ('+res.status+')', false); }
     }catch(e){ toast('Netzwerkfehler: '+e, false); }
   });
   $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
@@ -238,9 +310,12 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   }
   $('#powerBtn').addEventListener('click', ()=>{
     const on = $('#powerBtn').dataset.state!=='off';
-    postLed({ power: !on, brightness: +$('#brightRange').value,
+    postLed({
+      power: !on,
+      brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)} });
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
+    });
   });
   $('#standbyBtn').addEventListener('click', async ()=>{
     try{
@@ -251,14 +326,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     }catch(e){ toast('Fehler: '+e, false); }
   });
 
-  $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
+  $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent=e.target.value);
   $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
 
+  // Color inputs live preview + save
+  ['cLow','cMid','cHigh'].forEach(id=>{ $('#'+id).addEventListener('input', updateAllPreviews); });
   $('#ledSave').addEventListener('click', ()=>{
-    postLed({ power: $('#powerBtn').dataset.state!=='off',
+    postLed({
+      power: $('#powerBtn').dataset.state!=='off',
       brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
-      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)} });
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
+    });
   });
 
   // Status holen & UI updaten
@@ -268,6 +347,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       if(!r.ok) throw new Error(r.status);
       const s = await r.json();
 
+      // WLAN / Zeit
       $('#ip').textContent = s.ip || '-';
       $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
       $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
@@ -277,12 +357,13 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
 
       // Countdown / Modus / Standby
-      $('#modeBadge').textContent = 'Modus: ' + (s.mode || 'countdown');
-      secondsRemaining = s.secondsToBus || 0;
+      mode = s.mode || 'countdown';
+      $('#modeBadge').textContent = 'Modus: ' + mode;
+      secondsRemaining = timeSynced ? (s.secondsToBus || 0) : 0;
       setStandbyBtn(!!s.standby);
+      setPowerBtn(!!s.ledPower);
 
       // LED-Settings
-      setPowerBtn(!!s.ledPower);
       $('#brightRange').value = s.brightness ?? 40;
       $('#brightVal').textContent = $('#brightRange').value;
 
@@ -291,36 +372,40 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         $('#tMid').value = s.thresholds.mid ?? 90;
       }
       if (s.colors){
-        if (s.colors.low)  document.getElementById('cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
-        if (s.colors.mid)  document.getElementById('cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
-        if (s.colors.high) document.getElementById('cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
+        const cL=s.colors.low, cM=s.colors.mid, cH=s.colors.high;
+        if (cL) $('#cLow').value = rgb2hex(cL[0],cL[1],cL[2]);
+        if (cM) $('#cMid').value = rgb2hex(cM[0],cM[1],cM[2]);
+        if (cH) $('#cHigh').value= rgb2hex(cH[0],cH[1],cH[2]);
+        updateAllPreviews();
       }
 
       // JSON-Log
       try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
 
-      // Countdown-Farbe (vom Server geliefertes currentColor)
+      syncCountdown = timeSynced ? 5 : 1;
       setCountdownColorFromServer(s.currentColor);
-      syncCountdown = 5;
     }catch(e){ /* AP-Modus ok */ }
   }
 
   // Sekundentick
   setInterval(()=>{
-    const mmss = (secondsRemaining>0)? secondsRemaining : 0;
-    document.getElementById('countMMSS').textContent = fmt(mmss);
+    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
     if(secondsRemaining>0) secondsRemaining--;
+    $('#countMMSS').textContent = fmt(secondsRemaining);
     if(syncCountdown>0) syncCountdown--;
-    document.getElementById('nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
+    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
   }, 1000);
 
   // Status polling
   setInterval(refreshStatus, 1000);
   refreshStatus();
+  updateAllPreviews();
 })();
 </script>
-</body></html>
+</body>
+</html>
 )HTML";
+
 
 // ---------- Hilfen ----------
 void logLine(const String &s) {
