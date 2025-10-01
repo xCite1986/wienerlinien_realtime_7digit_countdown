@@ -311,14 +311,34 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   const fmt = s => (String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'));
 
   // ---- State ----
-  let secondsRemaining = 0;
-  let mode = 'countdown';
-  let syncCountdown = 0;
-  let timeSynced = false;
+  let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
   let standby = false;
 
-  // NEU: merkt sich, ob das Gerät neue Daten geliefert hat
-  let lastUpdateMsSeen = -1;  // kommt direkt aus /api/status (Millis der MCU)
+  // NEU: merkt sich, ob vom Gerät wirklich neue Daten kamen
+  let lastUpdateMsSeen = -1;
+
+  // Farbe-Chips
+  const setChip = (el, hex) => { el.style.background = hex; };
+
+  // Leaflet Map
+  let map, marker, haveMap=false;
+  function ensureMap(lat, lon){
+    if(!haveMap){
+      map = L.map('stopMap', {zoomControl:true, attributionControl:true});
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap'
+      }).addTo(map);
+      haveMap = true;
+    }
+    const ll = [lat, lon];
+    if(!marker){
+      marker = L.marker(ll).addTo(map);
+    }else{
+      marker.setLatLng(ll);
+    }
+    map.setView(ll, 16);
+  }
 
   function setPowerBtn(v){ $('#powerBtn').dataset.state = v ? 'on':'off'; $('#powerBtn').textContent = 'LED: ' + (v?'an':'aus'); }
   function setStandbyBtn(v){ standby=v; $('#standbyBtn').textContent = 'Standby: ' + (v?'an':'aus'); $('#standbyBadge').textContent='Standby: '+(v?'an':'aus'); }
@@ -327,9 +347,77 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     $('#countMMSS').style.color = rgb2hex(col[0], col[1], col[2]);
   }
 
-  // … (dein übriger Code bleibt unverändert, z.B. Map/Chips/Buttons)
+  // Setup speichern
+  $('#saveBtn').addEventListener('click', async ()=>{
+    const ssid=$('#ssid').value.trim(), password=$('#pwd').value, rbl=$('#rbl').value.trim(), apiKey=$('#apikey').value.trim();
+    if(!ssid||!rbl||!apiKey){ toast('Bitte SSID, RBL und API-Key ausfüllen', false); return; }
+    try{
+      const res = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password,rbl,apiKey})});
+      if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(), 3000); } else { toast('Fehler beim Speichern ('+res.status+')', false); }
+    }catch(e){ toast('Netzwerkfehler: '+e, false); }
+  });
+  $('#statusBtn').addEventListener('click', ()=>location.href('/api/status'));
 
-  // -------- Status holen & UI updaten (nur bei echten neuen Daten Sekunden übernehmen) --------
+  // LittleFS formatieren
+  $('#fsFormatBtn').addEventListener('click', async ()=>{
+    const conf = prompt('SCHREIBE "FORMAT" um LittleFS zu formatieren (alle gespeicherten Daten gehen verloren).');
+    if (conf !== 'FORMAT') { toast('Abgebrochen'); return; }
+    try{
+      const r = await fetch('/api/fs-format', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'FORMAT'})});
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      if(j.ok){ toast('LittleFS formatiert. Neustart …'); setTimeout(()=>location.reload(), 2500); }
+      else toast('Fehler: '+(j.error||'unbekannt'), false);
+    }catch(e){ toast('Netzwerkfehler: '+e, false); }
+  });
+
+  // LED Controls
+  async function postLed(payload){
+    try{
+      const r = await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(!r.ok) throw new Error(r.status);
+      toast('LED-Settings übernommen');
+    }catch(e){ toast('Fehler: '+e, false); }
+  }
+  $('#powerBtn').addEventListener('click', ()=>{
+    const on = $('#powerBtn').dataset.state!=='off';
+    postLed({
+      power: !on,
+      brightness: +$('#brightRange').value,
+      thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
+    });
+  });
+  $('#standbyBtn').addEventListener('click', async ()=>{
+    try{
+      const r = await fetch('/api/standby',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({standby: !standby})});
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json(); setStandbyBtn(!!j.standby);
+      toast('Standby '+(j.standby?'aktiviert':'deaktiviert'));
+    }catch(e){ toast('Fehler: '+e, false); }
+  });
+
+  $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
+  $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
+
+  const updateChips = ()=>{
+    setChip($('#chipLow'),  $('#cLow').value);
+    setChip($('#chipMid'),  $('#cMid').value);
+    setChip($('#chipHigh'), $('#cHigh').value);
+  };
+  ['cLow','cMid','cHigh'].forEach(id=>$('#'+id).addEventListener('input', updateChips));
+  updateChips();
+
+  $('#ledSave').addEventListener('click', ()=>{
+    postLed({
+      power: $('#powerBtn').dataset.state!=='off',
+      brightness: +$('#brightRange').value,
+      thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
+      colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
+    });
+  });
+
+  // Status holen & UI updaten  — Sekunden nur bei neuen MCU-Daten übernehmen
   async function refreshStatus(){
     try{
       const r = await fetch('/api/status',{cache:'no-store'});
@@ -341,7 +429,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
       $('#wlstate').textContent = 'WLAN: ' + (s.ip ? 'verbunden' : 'getrennt');
       $('#wlstate').style.borderColor = s.ip ? 'rgba(122,217,107,.6)' : '#7d262c';
-
       timeSynced = !!s.timeSynced;
       $('#timesync').textContent = 'Zeit: ' + (timeSynced ? 'synchron' : 'noch nicht synchron');
       $('#timesync').className = 'badge ' + (timeSynced ? '' : 'warn');
@@ -364,13 +451,13 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         if (s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
         if (s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
         if (s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
-        // falls du Chips hast: updateChips();
+        updateChips();
       }
 
-      // Koordinaten / Map (falls vorhanden)
+      // Karte
       if (s.coords && typeof s.coords.lat === 'number' && typeof s.coords.lon === 'number'){
         $('#coordLbl').textContent = s.coords.lat.toFixed(6)+', '+s.coords.lon.toFixed(6);
-        // ensureMap(s.coords.lat, s.coords.lon);
+        ensureMap(s.coords.lat, s.coords.lon);
       } else {
         $('#coordLbl').textContent = '—';
       }
@@ -381,41 +468,33 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         if(l.ok){ $('#log').value = await l.text(); }
       }catch(_){}
 
-      // NEU: Nur bei neuer Datenbasis Sekunden übernehmen (sonst lokal weiterzählen)
+      // Nur übernehmen, wenn MCU neue Daten hat
       const srvHasNewData = (typeof s.lastUpdateMs === 'number') && (s.lastUpdateMs !== lastUpdateMsSeen);
       if (timeSynced && !standby && srvHasNewData) {
         secondsRemaining = Math.max(0, s.secondsToBus|0);
         lastUpdateMsSeen = s.lastUpdateMs;
-        syncCountdown = 5; // UI-Info
+        syncCountdown = 5;
       }
 
-      // Farbe für den großen Countdown vom Server ableiten (bleibt rein kosmetisch)
       setCountdownColorFromServer(s.currentColor);
-
-    }catch(e){
-      // AP-Modus o.ä. – kein hartes Fehlverhalten
-    }
+    }catch(e){ /* AP-Modus ok */ }
   }
 
-  // -------- Sekundentick (rein lokal) --------
+  // Sekundentick (lokal herunterzählen)
   setInterval(()=>{
-    if(mode==='off' || !timeSynced || standby){
-      $('#countMMSS').textContent='--:--';
-      return;
-    }
-    if(secondsRemaining>0) secondsRemaining = secondsRemaining - 1;
-    if(secondsRemaining < 0) secondsRemaining = 0;
+    if(mode==='off' || !timeSynced || standby){ $('#countMMSS').textContent='--:--'; return; }
+    if(secondsRemaining>0) secondsRemaining--;
     $('#countMMSS').textContent = fmt(secondsRemaining);
-
     if(syncCountdown>0) syncCountdown--;
-    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? (syncCountdown+'s') : '—');
+    $('#nextSync').textContent = 'Sync in: ' + (syncCountdown>0? syncCountdown+'s':'—');
   }, 1000);
 
-  // Status polling (kann bei 1000ms bleiben; zählt lokal weiter, weil wir nicht überschreiben)
+  // Status polling
   setInterval(refreshStatus, 1000);
   refreshStatus();
 })();
 </script>
+
 </body></html>
 )HTML";
 
