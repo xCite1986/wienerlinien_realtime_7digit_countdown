@@ -1,163 +1,156 @@
-# Wiener Linien Countdown – 4×7‑Segment NeoPixel Display (ESP8266)
+# 🚏 Wiener Linien Countdown Display
 
-ESP8266‑Projekt (Wemos D1 mini) für eine **4‑stellige 7‑Segment‑Anzeige** aus WS2812B/NeoPixeln.
-Zeigt die Restzeit bis zur nächsten Abfahrt (Wiener Linien **OGD Realtime**), hat **REST‑API** zur LED‑Steuerung, **OTA**, **mDNS**, **LittleFS**‑Konfiguration, nicht‑blockierende Loop & Backoff.
-
-> **Projektfoto / LED‑Pfad:** _Hier dein Bild einfügen_ (z. B. in `docs/` ablegen und unten verlinken).
+Ein ESP8266-basiertes Projekt, das die **Abfahrtszeiten der Wiener Linien** von der offiziellen OGD-API abruft und auf einem **NeoPixel 7-Segment-Display (4-stellig mit Doppelpunkt)** darstellt.  
+Dazu gibt es ein **Webinterface** mit Setup, Live-Status, LED-Steuerung und einer **OpenStreetMap-Karte** der Haltestelle.
 
 ---
 
-## Features
+## ✨ Features
 
-- Countdown in `MM:SS`, Fallback auf blinkende Minuszeichen
-- REST‑API
-  - `GET /api/status`
-  - `POST /api/config` – WLAN, API‑Key, RBL, Zeitzone, TLS‑Optionen
-  - `POST /api/led` – Power, Helligkeit, Farbe
-  - `POST /api/display` – Modus `countdown|off|minus`, Farbe/Helligkeit
-  - `POST /api/fetch-now` – sofortige API‑Abfrage
-  - `POST /api/factoryreset` – löscht `/config.json`
-  - `GET /status-log` – Ringlog abrufen
-- **Sicheres HTTPS** (CA‑Validierung oder Fingerprint‑Pinning; optional `insecure` zum Testen)
-- **OTA‑Updates** (ArduinoOTA), **mDNS** (`http://wldisplay.local`)
-- **LittleFS** JSON‑Konfiguration
-- Nicht‑blockierendes Design mit **Exponential Backoff** bei API‑Fehlern
-
----
-
-## Hardware
-
-- **7-Segment-Gehäuse:** https://makerworld.com/de/models/892517-7-segment-clock-for-led-strips?from=search#profileId-849334
-- **Controller:** Wemos D1 mini (ESP8266)
-- **LEDs:** WS2812B/NeoPixel (56 LEDs → 4 Digits × 7 Segmente × 2 LEDs/Segment)
-- **Widerstand:** 330–470 Ω in Serie im **Data‑Pin** (nahe am ersten LED)
-- **Kondensator:** 1000 µF / ≥6.3 V zwischen **+5 V** und **GND** (nah am Strip)
-- **Netzteil:** 5 V (mit Reserve; z. B. ≥1 A je nach Helligkeit)
-- **Optional:** 3.3 V→5 V **Level‑Shifter** für den Datapin (bei langen Leitungen/Problemen)
-- **Gemeinsame Masse ist Pflicht!**
-
-🖼 **Schaltplan**: [`docs/esp8266_neopixel_schematic.svg`](docs/esp8266_neopixel_schematic.svg)
+- **Countdown (MM:SS)** zur nächsten Abfahrt in Farbe (Rot / Gelb / Grün, je nach Zeit).
+- **NeoPixel 7-Segment-Display** (4-stellig, Doppelpunkt optional, insgesamt 58 LEDs).
+- **Webinterface**:
+  - WLAN & API-Key Setup
+  - LED-Einstellungen (Helligkeit, Farben, Schwellwerte)
+  - Standby- und Power-Schalter
+  - Live-Countdown & Log der API-Antwort
+  - OpenStreetMap-Karte der Haltestelle
+  - LittleFS-Formatierung
+- **REST-API Endpunkte** (siehe unten).
+- **OTA Updates** und **mDNS (`http://wldisplay.local`)**.
+- **LittleFS** für Konfiguration.
 
 ---
 
-## 3D‑Druck
+## 🛠️ Hardware
 
-- 4‑stellige 7‑Segment‑Maske mit 2 LEDs pro Segment (insgesamt 56 LEDs).
-- Schwarze Separatoren reduzieren Lichtübersprechen; Diffusor weiß/transparent.
-- **Foto/LED‑Pfad:**
+- **Wemos D1 Mini (ESP8266)** oder kompatibel.
+- **NeoPixel-Strip** mit **58 LEDs** (4×14 Segmente + 2 Doppelpunkt-LEDs).
+- 5V Netzteil (mind. 2A empfohlen).
+- Optional: 3D-Druck-Gehäuse für 7-Segment-Zahlen.
 
-<img width="1527" height="706" alt="2025-09-29_09h14_15" src="https://github.com/user-attachments/assets/ff1b70bc-2152-45a6-9f67-ccca70d24c61" />
+### LED-Layout
+
+
+- Je Ziffer: 7 Segmente × 2 LEDs = 14 LEDs
+- Doppelpunkt: 2 LEDs (Index 56/57)
 
 ---
 
-## Software
+## 🔌 Schaltung
 
-### Abhängigkeiten
+- **D4 (GPIO2)** → Data-In des NeoPixel-Strips  
+- **5V** → VCC Strip  
+- **GND** → GND Strip  
+- ggf. 330 Ω Widerstand in der Datenleitung  
+- ggf. 1000 µF Elko parallel an 5V/GND
 
-- Arduino Core ESP8266
-- Libraries:
+---
+
+## 📦 Software Setup
+
+### 1. Arduino IDE vorbereiten
+- [Arduino IDE](https://www.arduino.cc/en/software) installieren
+- ESP8266 Board-Paket hinzufügen (`http://arduino.esp8266.com/stable/package_esp8266com_index.json`)
+- Bibliotheken installieren:
   - `Adafruit NeoPixel`
   - `ArduinoJson`
+  - `ESP8266WiFi`, `ESP8266WebServer`, `ArduinoOTA`, `ESP8266mDNS`
+  - `LittleFS`
 
-Eine passende `platformio.ini`:
-
-```ini
-[env:d1_mini]
-platform = espressif8266
-board = d1_mini
-framework = arduino
-monitor_speed = 115200
-
-lib_deps =
-  adafruit/Adafruit NeoPixel@^1.12.3
-  bblanchon/ArduinoJson@^7.0.4
-
-build_flags =
-  -D PIO_FRAMEWORK_ARDUINO_LWIP2_LOW_MEMORY
-  -D BEARSSL_SSL_BASIC
-```
-
-### Flashen & erster Start
-
-1. Kompilieren & flashen (PlatformIO).
-2. Ohne gespeicherte WLAN‑Daten startet **AP‑Modus**:
-   - SSID: `WienerLinienDisplaySetup`
-   - Passwort: `12345678`
-3. Per REST `/api/config` WLAN+API setzen.
-4. Danach erreichbar unter `http://wldisplay.local/` (mDNS) oder via IP.
-5. **OTA**: Hostname `wldisplay`.
+### 2. Sketch flashen
+- Code aus diesem Repository öffnen
+- Board: **Wemos D1 mini**
+- Upload & anschließend **LittleFS Filesystem** flashen (Menü: "ESP8266 LittleFS Data Upload")
 
 ---
 
-## REST‑API (Kurz)
+## 🌐 Webinterface
 
-**Status**  
-`GET /api/status`
+Nach dem Start:
 
-**Konfiguration**  
-`POST /api/config`
-```json
-{ "ssid":"MeinWLAN", "password":"geheim", "apiKey":"KEY", "rbl":"1234",
-  "tz":"CET-1CEST,M3.5.0,M10.5.0/3", "httpsInsecure":false,
-  "httpsFingerprint":"AA BB CC ... 99" }
-```
+- Im Setup-Modus (wenn keine WLAN-Daten):  
+  `WienerLinienDisplaySetup` WLAN (Passwort `12345678`) verbinden  
+  → Webinterface: [http://192.168.4.1/](http://192.168.4.1/)
 
-**LED‑Steuerung**  
-`POST /api/led`
-```json
-{ "power": true, "brightness": 30, "color": [255,128,0] }
-```
+- Im WLAN:  
+  Zugriff über **IP** oder [http://wldisplay.local](http://wldisplay.local)
 
-**Display‑Modus**  
-`POST /api/display`
-```json
-{ "mode":"countdown" }   // "off" | "minus"
-```
-
-**Sofortige Abfrage**  
-`POST /api/fetch-now` → `{}`
-
-**Werkseinstellungen**  
-`POST /api/factoryreset` → `{}`
-
-**Log**  
-`GET /status-log`
+Screens im Webinterface:
+- **Setup**: SSID, Passwort, RBL (Haltestellen-ID), API-Key
+- **Live-Anzeige**: Countdown (MM:SS), Log der API
+- **Karte**: Haltestelle in OpenStreetMap
+- **LED & Farben**: Power, Helligkeit, Farb-Schwellen
+- **Extras**: LittleFS formatieren, Status, OTA
 
 ---
 
-## Segment‑Mapping
+## 🔗 API Endpunkte
 
-- **Digits:** 0..3 links→rechts
-- **Segmente je Digit:** 0..6 (Segment 6 = Mittelstrich)
-- **LEDs pro Segment:** 2  
-Mapping in `digitSegmentMap` im Quellcode anpassen, falls dein Pfad abweicht.
+Die Firmware bietet eine REST-API:
 
----
-
-## Sicherheit
-
-- Standard: **TLS‑Validierung** gegen CA‑Store (BearSSL).
-- Optional: **Fingerprint‑Pinning** (`httpsFingerprint`).
-- Testweise: `httpsInsecure=true` (nicht empfohlen).
-- Für Exposed‑Setups: Auth via Reverse‑Proxy/Basic‑Auth ergänzen.
-
----
-
-## Troubleshooting
-
-- **Flackern/keine Anzeige:** GND gemeinsam? 330–470 Ω Data‑Widerstand? 1000 µF Elko am Strip?
-- **Timing instabil:** Leitung kürzen, ggf. Level‑Shifter einsetzen.
-- **Falsche Zeit:** `/status-log` prüfen, Zeitzone/ISO‑Parsing ok?
-- **Reboots:** Netzteil stärker, Helligkeit reduzieren.
+| Endpoint          | Methode | Beschreibung                          |
+|-------------------|---------|--------------------------------------|
+| `/api/status`     | GET     | JSON Status (IP, RSSI, Countdown etc.) |
+| `/api/config`     | POST    | WLAN + API-Config speichern          |
+| `/api/led`        | POST    | LED-Einstellungen (Helligkeit, Farben) |
+| `/api/display`    | POST    | Anzeige-Modus (countdown, off, minus, standby) |
+| `/api/standby`    | POST    | Standby ein/aus                      |
+| `/api/fetch-now`  | POST    | Sofort API neu abfragen              |
+| `/api/fs-format`  | POST    | LittleFS formatieren                 |
+| `/api/last-payload` | GET   | Letzte API-Rohantwort                 |
 
 ---
 
-## Lizenz
+## 🧪 LED-Diagnose
 
-MIT
+Test-Sketch, um die LEDs zu prüfen:
 
-## Credits
+```cpp
+#include <Adafruit_NeoPixel.h>
 
-- CAD/3D & Integration: [**26110lwcc**](https://makerworld.com/de/@26110lwcc)
-- Libraries: Adafruit NeoPixel, ArduinoJson
-- Daten: Wiener Linien OGD Realtime
+#define PIN            D4          // D4 = GPIO2 auf dem Wemos D1 Pro/Mini
+#define NUMPIXELS      58          // Anzahl der NeoPixel
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  pixels.begin(); // Initialisierung der NeoPixel
+  pixels.clear(); // Alle Pixel aus
+  pixels.show();
+}
+
+void loop() {
+  // Test 1: Alle nacheinander rot, grün, blau durchgehen
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(255,0,0)); // Rot
+    pixels.show();
+    delay(50);
+  }
+  delay(300);
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(0,255,0)); // Grün
+    pixels.show();
+    delay(50);
+  }
+  delay(300);
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(0,0,255)); // Blau
+    pixels.show();
+    delay(50);
+  }
+  delay(300);
+
+  // Test 2: Alle gleichzeitig weiß
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(255,255,255));
+  }
+  pixels.show();
+  delay(1000);
+
+  // Ausmachen
+  pixels.clear();
+  pixels.show();
+  delay(1000);
+}
+
