@@ -472,7 +472,15 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       }
 
       // JSON-Log
-      try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
+      try {
+        const l = await fetch('/api/last-payload',{cache:'no-store'});
+        if (l.ok) {
+          const txt = await l.text();
+          const ts = new Date().toLocaleTimeString(); // aktueller Zeitstempel
+          $('#log').value = `[${ts}] API-Refresh\n` + txt;
+        }
+      } catch(_) {}
+
 
       // Sekunden nur bei neuen MCU-Daten übernehmen
       const srvHasNewData = (typeof s.lastUpdateMs === 'number') && (s.lastUpdateMs !== lastUpdateMsSeen);
