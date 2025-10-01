@@ -313,9 +313,16 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   // ---- State ----
   let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
   let standby = false;
+  let lastUpdateMsSeen = -1;              // nur neue MCU-Daten übernehmen
 
-  // NEU: merkt sich, ob vom Gerät wirklich neue Daten kamen
-  let lastUpdateMsSeen = -1;
+  // NEW: Felder, die vom Nutzer geändert wurden → nicht vom Server überschreiben
+  const dirty = {
+    cLow:false, cMid:false, cHigh:false,
+    tLow:false, tMid:false,
+    brightness:false
+  };
+  const markDirty = key => { dirty[key] = true; };
+  const clearDirtyAll = () => { Object.keys(dirty).forEach(k => dirty[k]=false); };
 
   // Farbe-Chips
   const setChip = (el, hex) => { el.style.background = hex; };
@@ -332,11 +339,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       haveMap = true;
     }
     const ll = [lat, lon];
-    if(!marker){
-      marker = L.marker(ll).addTo(map);
-    }else{
-      marker.setLatLng(ll);
-    }
+    if(!marker){ marker = L.marker(ll).addTo(map); } else { marker.setLatLng(ll); }
     map.setView(ll, 16);
   }
 
@@ -356,7 +359,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       if(res.ok){ toast('Gespeichert. Neustart…'); setTimeout(()=>location.reload(), 3000); } else { toast('Fehler beim Speichern ('+res.status+')', false); }
     }catch(e){ toast('Netzwerkfehler: '+e, false); }
   });
-  $('#statusBtn').addEventListener('click', ()=>location.href('/api/status'));
+  $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
 
   // LittleFS formatieren
   $('#fsFormatBtn').addEventListener('click', async ()=>{
@@ -397,27 +400,35 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     }catch(e){ toast('Fehler: '+e, false); }
   });
 
-  $('#brightRange').addEventListener('input', (e)=>$('#brightVal').textContent = e.target.value);
-  $('#brightRange').addEventListener('change', (e)=>postLed({brightness:+e.target.value}));
+  // Brightness/Thresholds – beim Ändern "dirty" setzen
+  $('#brightRange').addEventListener('input', (e)=>{ $('#brightVal').textContent = e.target.value; markDirty('brightness'); });
+  $('#brightRange').addEventListener('change', ()=>{/* nur lokal bis Save */});
+  $('#tLow').addEventListener('input', ()=>markDirty('tLow'));
+  $('#tMid').addEventListener('input', ()=>markDirty('tMid'));
 
+  // Farben – beim Ändern "dirty" setzen und Chip live updaten
   const updateChips = ()=>{
     setChip($('#chipLow'),  $('#cLow').value);
     setChip($('#chipMid'),  $('#cMid').value);
     setChip($('#chipHigh'), $('#cHigh').value);
   };
-  ['cLow','cMid','cHigh'].forEach(id=>$('#'+id).addEventListener('input', updateChips));
+  $('#cLow').addEventListener('input', ()=>{ markDirty('cLow'); updateChips(); });
+  $('#cMid').addEventListener('input', ()=>{ markDirty('cMid'); updateChips(); });
+  $('#cHigh').addEventListener('input', ()=>{ markDirty('cHigh'); updateChips(); });
   updateChips();
 
-  $('#ledSave').addEventListener('click', ()=>{
-    postLed({
+  // Speichern → an MCU senden und Dirty-Flags zurücksetzen
+  $('#ledSave').addEventListener('click', async ()=>{
+    await postLed({
       power: $('#powerBtn').dataset.state!=='off',
       brightness: +$('#brightRange').value,
       thresholds:{low:+$('#tLow').value, mid:+$('#tMid').value},
       colors:{low:hex2rgb($('#cLow').value), mid:hex2rgb($('#cMid').value), high:hex2rgb($('#cHigh').value)}
     });
+    clearDirtyAll();
   });
 
-  // Status holen & UI updaten  — Sekunden nur bei neuen MCU-Daten übernehmen
+  // Status holen & UI updaten (respektiert Dirty-Flags)
   async function refreshStatus(){
     try{
       const r = await fetch('/api/status',{cache:'no-store'});
@@ -438,19 +449,17 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       $('#modeBadge').textContent = 'Modus: ' + mode;
       setStandbyBtn(!!s.standby);
 
-      // LED-Settings
+      // LED-Settings (nur wenn nicht dirty)
       setPowerBtn(!!s.ledPower);
-      $('#brightRange').value = s.brightness ?? 40;
-      $('#brightVal').textContent = $('#brightRange').value;
-
+      if (!dirty.brightness) { $('#brightRange').value = s.brightness ?? 40; $('#brightVal').textContent = $('#brightRange').value; }
       if (s.thresholds){
-        $('#tLow').value = s.thresholds.low ?? 30;
-        $('#tMid').value = s.thresholds.mid ?? 90;
+        if (!dirty.tLow) $('#tLow').value = s.thresholds.low ?? 30;
+        if (!dirty.tMid) $('#tMid').value = s.thresholds.mid ?? 90;
       }
       if (s.colors){
-        if (s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
-        if (s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
-        if (s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
+        if (!dirty.cLow  && s.colors.low)  $('#cLow').value  = rgb2hex(s.colors.low[0],  s.colors.low[1],  s.colors.low[2]);
+        if (!dirty.cMid  && s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
+        if (!dirty.cHigh && s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
         updateChips();
       }
 
@@ -463,12 +472,9 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       }
 
       // JSON-Log
-      try{
-        const l = await fetch('/api/last-payload',{cache:'no-store'});
-        if(l.ok){ $('#log').value = await l.text(); }
-      }catch(_){}
+      try{ const l = await fetch('/api/last-payload',{cache:'no-store'}); if(l.ok){ $('#log').value = await l.text(); } }catch(_){}
 
-      // Nur übernehmen, wenn MCU neue Daten hat
+      // Sekunden nur bei neuen MCU-Daten übernehmen
       const srvHasNewData = (typeof s.lastUpdateMs === 'number') && (s.lastUpdateMs !== lastUpdateMsSeen);
       if (timeSynced && !standby && srvHasNewData) {
         secondsRemaining = Math.max(0, s.secondsToBus|0);
@@ -494,7 +500,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   refreshStatus();
 })();
 </script>
-
 </body></html>
 )HTML";
 
