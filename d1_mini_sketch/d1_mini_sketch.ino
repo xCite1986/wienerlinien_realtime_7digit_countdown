@@ -22,11 +22,11 @@
 #include <time.h>
 
 // ---------- Hardware ----------
-#define LED_PIN         D4
+#define LED_PIN         D2
 #define NUM_DIGITS      4
 #define NUM_SEGMENTS    7
 #define LEDS_PER_SEG    2
-#define NUM_LEDS        (NUM_DIGITS*NUM_SEGMENTS*LEDS_PER_SEG)
+#define NUM_LEDS        58
 
 // ---------- LED Strip ----------
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -150,17 +150,53 @@ double stopLon = 0.0, stopLat = 0.0;
 
 const time_t TIME_VALID_EPOCH = 1700000000; // ~2023-11-14
 
-// ---------- 7-Segment Mapping ----------
-const uint8_t digitSegmentMap[4][14] PROGMEM = {
-  { 0,1,  2,3,  4,5,  6,7,  8,9, 10,11, 12,13 },
-  {14,15, 16,17, 18,19, 20,21, 22,23, 24,25, 26,27 },
-  {28,29, 30,31, 32,33, 34,35, 36,37, 38,39, 40,41 },
-  {42,43, 44,45, 46,47, 48,49, 50,51, 52,53, 54,55 }
+// ---------- 7-Segment Mapping (angepasst an deine Verdrahtung) ----------
+// Logische Reihenfolge im Code: digit 0..3 = links→rechts  (MM:SS)
+// Physische Verdrahtung (0-basiert): 44–57 (digit0), 30–43 (digit1), 14–27 (digit2), 0–13 (digit3)
+// Colon sitzt dazwischen auf 28,29.
+
+const uint8_t DIGIT_BASE[4] = {
+  44, // digit 0 (links außen)  -> LEDs 45..58 (1-basiert)
+  30, // digit 1 (2. von links) -> LEDs 31..44
+  14, // digit 2 (3. von links) -> LEDs 15..28
+   0  // digit 3 (rechts außen) -> LEDs  1..14
 };
+
+// Reihenfolge der 7 Segmente innerhalb einer Ziffer.
+// Wenn deine beiden LEDs je Segment nicht genau in A,B,C,D,E,F,G laufen,
+// kannst du hier einfach die Paar-Indizes (0..13) umsortieren.
+// Standard: A,B,C,D,E,F,G  -> (0..13 paarweise)
+const uint8_t SEG_PAIR_ORDER[7][2] = {
+  {2,3},   // A  (oben)
+  {0,1},   // B  (oben rechts)
+  {8,9},   // C  (unten rechts)
+  {10,11},   // D  (unten)
+  {12,13},   // E  (unten links)
+  {4,5}, // F  (oben links)
+  {6,7}  // G  (Mitte)
+};
+
+// Aus obigen Tabellen das vollständige Mapping (14 Indizes pro Digit) bauen:
+uint8_t digitSegmentMap[4][14];
+void buildDigitMap() {
+  for (uint8_t d = 0; d < 4; ++d) {
+    for (uint8_t s = 0; s < 7; ++s) {
+      digitSegmentMap[d][s*2+0] = DIGIT_BASE[d] + SEG_PAIR_ORDER[s][0];
+      digitSegmentMap[d][s*2+1] = DIGIT_BASE[d] + SEG_PAIR_ORDER[s][1];
+    }
+  }
+}
+
+// 0/1-Muster für Ziffern 0..9 (A..G)
 const uint8_t digitPatterns[10][7] PROGMEM = {
-  {1,1,1,1,1,1,0},{0,1,1,0,0,0,0},{1,1,0,1,1,0,1},{1,1,1,1,0,0,1},{0,1,1,0,0,1,1},
-  {1,0,1,1,0,1,1},{1,0,1,1,1,1,1},{1,1,1,0,0,0,0},{1,1,1,1,1,1,1},{1,1,1,1,0,1,1}
+  {1,1,1,1,1,1,0}, {0,1,1,0,0,0,0}, {1,1,0,1,1,0,1}, {1,1,1,1,0,0,1},
+  {0,1,1,0,0,1,1}, {1,0,1,1,0,1,1}, {1,0,1,1,1,1,1}, {1,1,1,0,0,0,0},
+  {1,1,1,1,1,1,1}, {1,1,1,1,0,1,1}
 };
+
+// Doppelpunkt-LEDs (0-basiert):
+const uint8_t COLON_IDX[2] = {28, 29};
+
 
 // ---------- HTML ----------
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -625,18 +661,35 @@ void displayBlinkMinus(bool st,uint8_t r,uint8_t g,uint8_t b){
   strip.clear(); int d= st?0:1; for(int l=0;l<2;l++){ int idx = pgm_read_byte(&digitSegmentMap[d][6*2+l]); strip.setPixelColor(idx, strip.Color(r,g,b)); }
   strip.show(); lastDisplayValue="--";
 }
-void displayDigitsMMSS(int seconds,uint8_t r,uint8_t g,uint8_t b){
-  int min = seconds/60; if(min<0) min=0; int sec = seconds%60; if(sec<0) sec=0;
-  char buf[6]; sprintf(buf,"%02d:%02d",min,sec); lastDisplayValue = String(buf);
+void displayDigitsMMSS(int seconds, uint8_t r, uint8_t g, uint8_t b) {
+  int min = max(0, seconds / 60);
+  int sec = max(0, seconds % 60);
+  char buf[6]; sprintf(buf, "%02d:%02d", min, sec);
+  lastDisplayValue = String(buf);
+
   int dval[4] = { min/10, min%10, sec/10, sec%10 };
   strip.clear();
-  for (int d=0; d<4; d++){
-    uint8_t val=dval[d]; if(val>9) continue;
-    for(int s=0;s<7;s++){ bool on = pgm_read_byte(&digitPatterns[val][s]); if(!on) continue;
-      for(int l=0;l<2;l++){ int idx = pgm_read_byte(&digitSegmentMap[d][s*2+l]); strip.setPixelColor(idx, strip.Color(r,g,b)); } }
+
+  // 4 Ziffern
+  for (int d = 0; d < 4; d++) {
+    uint8_t val = dval[d];
+    for (int s = 0; s < 7; s++) {
+      if (!pgm_read_byte(&digitPatterns[val][s])) continue;
+      // 2 LEDs je Segment gemäß deinem Mapping
+      int i0 = digitSegmentMap[d][s*2+0];
+      int i1 = digitSegmentMap[d][s*2+1];
+      strip.setPixelColor(i0, strip.Color(r,g,b));
+      strip.setPixelColor(i1, strip.Color(r,g,b));
+    }
   }
+
+  // Doppelpunkt (fest an – wenn du blinken willst: nur bei gerader Sekunde setzen)
+  strip.setPixelColor(COLON_IDX[0], strip.Color(r,g,b));
+  strip.setPixelColor(COLON_IDX[1], strip.Color(r,g,b));
+
   strip.show();
 }
+
 void pickColorForSeconds(int secs, uint8_t &r,uint8_t &g,uint8_t &b){
   uint16_t a = min(cfg.tLow, cfg.tMid);
   uint16_t bnd = max(cfg.tLow, cfg.tMid);
@@ -802,26 +855,47 @@ void ensureWifi(){
   } else logLine("WLAN Fehler!");
 }
 bool ensureTime() {
-  configTime(0,0,"pool.ntp.org","time.nist.gov");
-  setenv("TZ", cfg.tz.c_str(), 1); tzset();
-  for (int i=0; i<50; i++){
+  // Nur versuchen, wenn STA verbunden – im AP-Modus abbrechen
+  if (WiFi.status() != WL_CONNECTED) {
+    timeSynced = false;
+    return false;
+  }
+
+  static bool ntpConfigured = false;
+  if (!ntpConfigured) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    setenv("TZ", cfg.tz.c_str(), 1);
+    tzset();
+    ntpConfigured = true;
+  }
+
+  for (int i = 0; i < 50; i++) {
     time_t now = time(nullptr);
     if (now >= TIME_VALID_EPOCH) {
       timeSynced = true;
       logLine(String("Zeit synchron: ") + String(ctime(&now)).c_str());
       return true;
     }
-    delay(200); yield();
+    delay(200);
+    yield();
   }
+
   timeSynced = (time(nullptr) >= TIME_VALID_EPOCH);
   return timeSynced;
 }
+
 
 // ---------- WL-Fetch ----------
 int fetchBusCountdown(){
   if (standby) return -1;
 
   ensureWifi();
+  if (WiFi.status() == WL_CONNECTED) {
+    ensureTime();   // nur mit Internet probieren
+  } else {
+    timeSynced = false;
+  }
+
   if (WiFi.status()!=WL_CONNECTED) return -1;
 
   // Nur fürs Log (die Berechnung nutzt serverTime)
@@ -1137,7 +1211,10 @@ void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sen
 void setup(){
   Serial.begin(115200); delay(200); Serial.println(); Serial.println("Booting… F_CPU="+String(F_CPU));
 
-  strip.begin(); strip.setBrightness(cfg.brightness); strip.show();
+  strip.begin();
+  buildDigitMap(); 
+  strip.setBrightness(cfg.brightness); 
+  strip.show();
   ensureFS();
   loadConfig();
 
