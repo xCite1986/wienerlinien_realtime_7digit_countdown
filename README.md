@@ -108,25 +108,49 @@ Test-Sketch, um die LEDs zu prüfen:
 
 ```cpp
 #include <Adafruit_NeoPixel.h>
-#define PIN D4
-#define NUMPIXELS 58
-Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+#define PIN            D4          // D4 = GPIO2 auf dem Wemos D1 Pro/Mini
+#define NUMPIXELS      58          // Anzahl der NeoPixel
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
 void setup() {
-  pixels.begin();
-  pixels.clear();
+  pixels.begin(); // Initialisierung der NeoPixel
+  pixels.clear(); // Alle Pixel aus
   pixels.show();
 }
 
 void loop() {
-  uint32_t colors[4] = {pixels.Color(255,0,0), pixels.Color(255,180,0), pixels.Color(0,255,0), pixels.Color(0,0,255)};
-  for (int c=0; c<4; c++) {
-    for (int i=0; i<NUMPIXELS; i++) {
-      pixels.setPixelColor(i, colors[c]);
-      pixels.show();
-      delay(100);
-      pixels.setPixelColor(i, 0);
-    }
-    delay(500);
+  // Test 1: Alle nacheinander rot, grün, blau durchgehen
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(255,0,0)); // Rot
+    pixels.show();
+    delay(50);
   }
+  delay(300);
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(0,255,0)); // Grün
+    pixels.show();
+    delay(50);
+  }
+  delay(300);
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(0,0,255)); // Blau
+    pixels.show();
+    delay(50);
+  }
+  delay(300);
+
+  // Test 2: Alle gleichzeitig weiß
+  for (uint16_t i=0; i<NUMPIXELS; i++) {
+    pixels.setPixelColor(i, pixels.Color(255,255,255));
+  }
+  pixels.show();
+  delay(1000);
+
+  // Ausmachen
+  pixels.clear();
+  pixels.show();
+  delay(1000);
 }
+
