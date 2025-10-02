@@ -41,11 +41,15 @@ sowie eine **REST-API** zur Steuerung.
 1. Trägerplatte mit dem 3D-Drucker herstellen, du findest sie [auf Makerworld unter 892517](https://makerworld.com/de/models/892517-7-segment-clock-for-led-strips) 
 2. NeoPixel Segmente zuschneiden und zu 4 Ziffern + Doppelpunkt zusammenfügen  
 3. LEDs auf Trägerplatte kleben
+
 ![Verklebtes LED-Stripe](docs/led_stripe_glued.png)
-4. Verdrahtung herstellen
+
+5. Verdrahtung herstellen
+
 ![Schema LED-Stripe](docs/led_wiring_schematic.png)
 ![Verdrahtetes LED-Stripe](docs/led_stripe_wired.png)
-5. Wemos D1 Mini verbinden:
+
+6. Wemos D1 Mini verbinden:
 
    - **D2 (GPIO4)** → Data-In NeoPixel  
    - **5V** → VCC Strip  
@@ -85,6 +89,7 @@ Zum Testen der Verdrahtung:
 
 - Sketch `wl7segment.ino` flashen  
 - Folgende Einstellungen in der Arduino-IDE verwenden
+
 ![IDE-Settings](docs/ide_settings.png)
 
 ---
