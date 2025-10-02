@@ -1,6 +1,6 @@
 #include <Adafruit_NeoPixel.h>
 
-#define PIN            D4          // D4 = GPIO2 auf dem Wemos D1 Pro/Mini
+#define PIN            D2          // D2 
 #define NUMPIXELS      58          // Anzahl der NeoPixel
 
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
