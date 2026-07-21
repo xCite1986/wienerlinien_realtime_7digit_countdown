@@ -54,6 +54,8 @@ struct AppConfig {
   String httpsFingerprint = "";
   // nur für NTP-Stempel (ohne TZ-Config, WL serverTime maßgeblich)
   String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
+  // Fahrplan-Fallback: timePlanned nutzen, wenn kein timeReal (Echtzeit) vorliegt
+  bool allowPlannedFallback = true;
 } cfg;
 
 String lastDisplayValue = "----";
@@ -69,6 +71,7 @@ unsigned long backoffMs = 20000;
 
 bool timeSynced = false;
 bool standby = false;
+bool usingPlanned = false; // true, wenn aktueller Countdown aus timePlanned (Fahrplan) statt timeReal stammt
 
 bool fsMounted = false;
 
@@ -251,7 +254,6 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <div class="flex">
         <button class="btn" id="saveBtn">Speichern & neu starten</button>
         <button class="btn secondary" id="statusBtn">Status</button>
-        <button class="btn warn" id="fsFormatBtn" title="Formatiert LittleFS! Vorsicht.">LittleFS formatieren</button>
       </div>
       <div class="kv"><span>IP: <b id="ip">-</b></span><span>RSSI: <b id="rssi">-</b></span>
         <span class="badge" id="wlstate">WLAN: unbekannt</span>
@@ -266,9 +268,14 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     <div class="count" id="countMMSS" style="color:#eaf2ff">--:--</div>
     <div class="flex">
       <span class="badge" id="modeBadge">Modus: countdown</span>
+      <span class="badge" id="srcBadge">Quelle: –</span>
       <span class="badge" id="nextSync">Sync in: -</span>
       <span class="badge" id="standbyBadge">Standby: aus</span>
     </div>
+    <label class="pill" style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:12px">
+      <input type="checkbox" id="plannedFallback" style="width:auto;height:auto">
+      <span>Fahrplan-Fallback (timePlanned), wenn keine Echtzeit — Doppelpunkt dann <b style="color:#3a86ff">blau</b></span>
+    </label>
     <div class="row" style="margin-top:12px">
       <label for="log">Letzte WL-JSON-Antwort</label>
       <textarea id="log" readonly placeholder="Noch keine Daten …"></textarea>
@@ -350,6 +357,7 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   let secondsRemaining = 0, mode = 'countdown', syncCountdown = 0, timeSynced = false;
   let standby = false;
   let lastUpdateMsSeen = -1;              // nur neue MCU-Daten übernehmen
+  let setupPrefilled = false;            // Setup-Felder nur einmal aus der Config befüllen
 
   // NEW: Felder, die vom Nutzer geändert wurden → nicht vom Server überschreiben
   const dirty = {
@@ -397,17 +405,13 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   });
   $('#statusBtn').addEventListener('click', ()=>location.href='/api/status');
 
-  // LittleFS formatieren
-  $('#fsFormatBtn').addEventListener('click', async ()=>{
-    const conf = prompt('SCHREIBE "FORMAT" um LittleFS zu formatieren (alle gespeicherten Daten gehen verloren).');
-    if (conf !== 'FORMAT') { toast('Abgebrochen'); return; }
+  // Fahrplan-Fallback (timePlanned) umschalten – wirkt sofort, ohne Neustart
+  $('#plannedFallback').addEventListener('change', async (e)=>{
     try{
-      const r = await fetch('/api/fs-format', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:'FORMAT'})});
+      const r = await fetch('/api/behavior',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plannedFallback: e.target.checked})});
       if(!r.ok) throw new Error(r.status);
-      const j = await r.json();
-      if(j.ok){ toast('LittleFS formatiert. Neustart …'); setTimeout(()=>location.reload(), 2500); }
-      else toast('Fehler: '+(j.error||'unbekannt'), false);
-    }catch(e){ toast('Netzwerkfehler: '+e, false); }
+      toast('Fahrplan-Fallback '+(e.target.checked?'aktiviert':'deaktiviert'));
+    }catch(err){ toast('Fehler: '+err, false); }
   });
 
   // LED Controls
@@ -471,6 +475,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       if(!r.ok) throw new Error(r.status);
       const s = await r.json();
 
+      // Setup-Felder einmalig mit aktueller Konfiguration vorbefüllen
+      if(!setupPrefilled){
+        if(s.ssid!==undefined)         $('#ssid').value   = s.ssid || '';
+        if(s.wifiPassword!==undefined) $('#pwd').value    = s.wifiPassword || '';
+        if(s.rbl!==undefined)          $('#rbl').value    = s.rbl || '';
+        if(s.apiKey!==undefined)       $('#apikey').value = s.apiKey || '';
+        setupPrefilled = true;
+      }
+      // Fahrplan-Fallback-Schalter spiegeln (nicht während der Nutzer ihn gerade bedient)
+      const pf = $('#plannedFallback');
+      if(pf && document.activeElement!==pf && s.allowPlannedFallback!==undefined) pf.checked = !!s.allowPlannedFallback;
+
       // WLAN / Zeit
       $('#ip').textContent = s.ip || '-';
       $('#rssi').textContent = (s.rssi!==undefined)? s.rssi+' dBm' : '-';
@@ -484,6 +500,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       mode = s.mode || 'countdown';
       $('#modeBadge').textContent = 'Modus: ' + mode;
       setStandbyBtn(!!s.standby);
+
+      // Quelle des angezeigten Werts: Echtzeit (timeReal) oder Fahrplan (timePlanned)
+      const sb = $('#srcBadge');
+      if (sb){
+        if (!timeSynced){
+          sb.textContent = 'Quelle: –'; sb.style.color=''; sb.style.borderColor='';
+        } else if (s.usingPlanned){
+          sb.textContent = 'Quelle: Fahrplan'; sb.style.color='#8ab6ff'; sb.style.borderColor='#3a6aa6';
+        } else {
+          sb.textContent = 'Quelle: Echtzeit'; sb.style.color='#9be08a'; sb.style.borderColor='rgba(122,217,107,.5)';
+        }
+      }
 
       // LED-Settings (nur wenn nicht dirty)
       setPowerBtn(!!s.ledPower);
@@ -683,9 +711,15 @@ void displayDigitsMMSS(int seconds, uint8_t r, uint8_t g, uint8_t b) {
     }
   }
 
-  // Doppelpunkt (fest an – wenn du blinken willst: nur bei gerader Sekunde setzen)
-  strip.setPixelColor(COLON_IDX[0], strip.Color(r,g,b));
-  strip.setPixelColor(COLON_IDX[1], strip.Color(r,g,b));
+  // Doppelpunkt: blau, wenn der Wert aus dem Fahrplan (timePlanned) stammt,
+  // sonst in der aktuellen Countdown-Farbe.
+  if (usingPlanned) {
+    strip.setPixelColor(COLON_IDX[0], strip.Color(0, 0, 255));
+    strip.setPixelColor(COLON_IDX[1], strip.Color(0, 0, 255));
+  } else {
+    strip.setPixelColor(COLON_IDX[0], strip.Color(r,g,b));
+    strip.setPixelColor(COLON_IDX[1], strip.Color(r,g,b));
+  }
 
   strip.show();
 }
@@ -714,7 +748,7 @@ bool saveConfig(){
     Serial.println("saveConfig: FS not mounted");
     return false;
   }
-  StaticJsonDocument<640> doc;
+  StaticJsonDocument<768> doc;
   doc["ssid"]=cfg.ssid; doc["password"]=cfg.password; doc["apiKey"]=cfg.apiKey; doc["rbl"]=cfg.rbl;
   doc["brightness"]=cfg.brightness; doc["ledPower"]=cfg.ledPower;
   doc["tLow"]=cfg.tLow; doc["tMid"]=cfg.tMid;
@@ -722,6 +756,7 @@ bool saveConfig(){
   JsonArray mid = doc.createNestedArray("colMid");  mid.add(cfg.colMid[0]);  mid.add(cfg.colMid[1]);  mid.add(cfg.colMid[2]);
   JsonArray hig = doc.createNestedArray("colHigh"); hig.add(cfg.colHigh[0]); hig.add(cfg.colHigh[1]); hig.add(cfg.colHigh[2]);
   doc["httpsInsecure"]=cfg.httpsInsecure; doc["httpsFingerprint"]=cfg.httpsFingerprint;
+  doc["allowPlannedFallback"]=cfg.allowPlannedFallback;
 
   String json; json.reserve(768);
   size_t want = serializeJson(doc, json);
@@ -840,6 +875,7 @@ void loadConfig(){
 
   cfg.httpsInsecure    = doc["httpsInsecure"]    | false;
   cfg.httpsFingerprint = doc["httpsFingerprint"] | "";
+  cfg.allowPlannedFallback = doc["allowPlannedFallback"] | true;
 
   Serial.println("---LittleFS Konfig geladen---");
 }
@@ -964,26 +1000,46 @@ int fetchBusCountdown(){
     Serial.println(String("coordinates: lon=")+String(lon,6)+", lat="+String(lat,6));
   }
 
-  // ---- timeReal sammeln (mit nahegelegenem countdown) ----
+  // ---- Abfahrtszeiten sammeln: bevorzugt timeReal, sonst timePlanned (Fahrplan) ----
   struct Hit { String iso; int countdown; };
   Hit hits[4]; int hitCount=0;
-  int pos=0;
-  while (hitCount < 4) {
-    String iso; int nextPos=0;
-    if (!scanQuotedAfter(payload, pos, "\"timeReal\":\"", iso, nextPos)) break;
 
-    // countdown in kleinem Fenster nach timeReal suchen
-    int cd = -1, dummy = 0;
-    int searchFrom = nextPos;
-    int searchTo   = min((int)payload.length(), searchFrom + 220);
-    String window  = payload.substring(searchFrom, searchTo);
-    (void)scanIntAfter(window, 0, "\"countdown\":", cd, dummy);
+  auto collectHits = [&](const char* needle){
+    hitCount = 0;
+    int pos = 0;
+    while (hitCount < 4) {
+      String iso; int nextPos=0;
+      if (!scanQuotedAfter(payload, pos, needle, iso, nextPos)) break;
 
-    hits[hitCount++] = { iso, cd };
-    pos = nextPos;
+      // countdown in kleinem Fenster nach der Zeitangabe suchen
+      int cd = -1, dummy = 0;
+      int searchFrom = nextPos;
+      int searchTo   = min((int)payload.length(), searchFrom + 220);
+      String window  = payload.substring(searchFrom, searchTo);
+      (void)scanIntAfter(window, 0, "\"countdown\":", cd, dummy);
+
+      hits[hitCount++] = { iso, cd };
+      pos = nextPos;
+    }
+  };
+
+  // 1) Echtzeit bevorzugen
+  collectHits("\"timeReal\":\"");
+  usingPlanned = false;
+
+  // 2) Fallback auf Fahrplan (timePlanned), wenn keine Echtzeit vorhanden
+  if (hitCount == 0 && cfg.allowPlannedFallback) {
+    collectHits("\"timePlanned\":\"");
+    if (hitCount > 0) {
+      usingPlanned = true;
+      logLine("Kein timeReal – Fallback auf timePlanned (Fahrplan, Doppelpunkt blau)");
+    }
   }
+
   if (hitCount == 0) {
-    logLine("timeReal nicht gefunden – Abbruch");
+    logLine(cfg.allowPlannedFallback
+              ? "Weder timeReal noch timePlanned gefunden – Abbruch"
+              : "timeReal nicht gefunden (Fallback deaktiviert) – Abbruch");
     return -1;
   }
 
@@ -1043,7 +1099,7 @@ void applyLedState(){
 void serveIndex(){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); }
 
 void handleStatus(){
-  StaticJsonDocument<1200> doc;
+  StaticJsonDocument<1536> doc;
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
@@ -1072,6 +1128,9 @@ void handleStatus(){
                 (mode==DisplayMode::OFF ? "off" :
                 (mode==DisplayMode::MINUS ? "minus" : "standby")));
   doc["ssid"] = cfg.ssid; doc["apiKey"] = cfg.apiKey; doc["rbl"] = cfg.rbl;
+  doc["wifiPassword"] = cfg.password;               // zum Vorbefüllen des Setup-Formulars
+  doc["allowPlannedFallback"] = cfg.allowPlannedFallback;
+  doc["usingPlanned"] = usingPlanned;               // aktueller Wert stammt aus dem Fahrplan
   doc["httpsInsecure"] = cfg.httpsInsecure; doc["httpsFingerprint"] = cfg.httpsFingerprint;
   doc["loglen"] = ringLog.length();
   String out; serializeJson(doc,out);
@@ -1166,6 +1225,17 @@ void handleStandbyPost(){
   server.send(200,"application/json", out);
 }
 
+void handleBehaviorPost(){
+  if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
+  StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  if(doc["plannedFallback"].is<bool>()) cfg.allowPlannedFallback = doc["plannedFallback"].as<bool>();
+  saveConfig();
+  // Direkt neu abfragen, damit die Umschaltung sofort greift
+  nextPollAt = millis();
+  String out = String("{\"ok\":true,\"plannedFallback\":") + (cfg.allowPlannedFallback?"true":"false") + "}";
+  server.send(200,"application/json", out);
+}
+
 void handleFetchNow(){
   int s=fetchBusCountdown(); if(s>=0){ secondsToBus=s; backoffMs=20000; }
   int mm = secondsToBus/60, ss = secondsToBus%60; char mmss[6]; sprintf(mmss,"%02d:%02d",mm,ss);
@@ -1241,6 +1311,7 @@ void setup(){
   server.on("/api/factoryreset",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/standby",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/fs-format",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
+  server.on("/api/behavior",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
 
   server.on("/api/config", HTTP_POST, [](){ addCORS(); handleConfigPost(); });
   server.on("/api/led", HTTP_POST, [](){ addCORS(); handleLedPost(); });
@@ -1248,6 +1319,7 @@ void setup(){
   server.on("/api/fetch-now", HTTP_POST, [](){ addCORS(); handleFetchNow(); });
   server.on("/api/factoryreset", HTTP_POST, [](){ addCORS(); handleFactoryReset(); });
   server.on("/api/standby", HTTP_POST, [](){ addCORS(); handleStandbyPost(); });
+  server.on("/api/behavior", HTTP_POST, [](){ addCORS(); handleBehaviorPost(); });
   server.on("/api/fs-format", HTTP_POST, [](){ addCORS(); handleFsFormat(); });
 
   server.on("/status-log", HTTP_GET, [](){ addCORS(); server.send(200,"text/plain", ringLog); });
