@@ -880,7 +880,7 @@ bool saveConfig(){
     Serial.println("saveConfig: FS not mounted");
     return false;
   }
-  StaticJsonDocument<1024> doc;
+  DynamicJsonDocument doc(1024);
   doc["ssid"]=cfg.ssid; doc["password"]=cfg.password; doc["apiKey"]=cfg.apiKey; doc["rbl"]=cfg.rbl;
   doc["brightness"]=cfg.brightness; doc["ledPower"]=cfg.ledPower;
   doc["tLow"]=cfg.tLow; doc["tMid"]=cfg.tMid;
@@ -984,7 +984,7 @@ void loadConfig(){
   Serial.print("config.json preview: ");
   Serial.println(raw);
 
-  StaticJsonDocument<1280> doc;
+  DynamicJsonDocument doc(1280);
   DeserializationError err = deserializeJson(doc, raw);
   if(err){
     Serial.print("Config JSON parse failed: "); Serial.println(err.c_str());
@@ -1250,7 +1250,7 @@ void applyLedState(){
 void serveIndex(){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); }
 
 void handleStatus(){
-  StaticJsonDocument<1792> doc;
+  DynamicJsonDocument doc(1792);
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
@@ -1297,6 +1297,8 @@ void handleStatus(){
   sch["remaining"] = schRemain;
 
   doc["loglen"] = ringLog.length();
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["freeStack"] = ESP.getFreeContStack();
   String out; serializeJson(doc,out);
   server.send(200,"application/json", out);
 }
@@ -1304,7 +1306,7 @@ void handleLastPayload(){ server.send(200, lastPayload.length()? "application/js
 
 void handleConfigPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<1024> doc;
+  DynamicJsonDocument doc(1024);
   if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
   if(doc["ssid"].is<const char*>())        cfg.ssid = doc["ssid"].as<const char*>();
   if(doc["password"].is<const char*>())    cfg.password = doc["password"].as<const char*>();
@@ -1331,7 +1333,7 @@ void handleConfigPost(){
 
 void handleLedPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<1024> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  DynamicJsonDocument doc(1024); if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
 
   if(doc["power"].is<bool>()) cfg.ledPower = doc["power"].as<bool>();
   if(doc["brightness"].is<int>()) cfg.brightness = (uint8_t)constrain((int)doc["brightness"],0,255);
@@ -1366,7 +1368,7 @@ void handleLedPost(){
 
 void handleDisplayPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<512> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  DynamicJsonDocument doc(512); if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
   if(doc["mode"].is<const char*>()){
     String m=doc["mode"].as<const char*>();
     if(m=="countdown") mode=DisplayMode::COUNTDOWN;
@@ -1380,7 +1382,7 @@ void handleDisplayPost(){
 
 void handleStandbyPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  DynamicJsonDocument doc(200); if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
   if(doc["standby"].is<bool>()){
     standby = doc["standby"].as<bool>();
     schedAwake = false; // manuelle Steuerung hat Vorrang vor dem Zeitplan-Auto-Sleep
@@ -1393,7 +1395,7 @@ void handleStandbyPost(){
 
 void handleBehaviorPost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  DynamicJsonDocument doc(200); if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
   if(doc["plannedFallback"].is<bool>()) cfg.allowPlannedFallback = doc["plannedFallback"].as<bool>();
   saveConfig();
   // Direkt neu abfragen, damit die Umschaltung sofort greift
@@ -1404,7 +1406,7 @@ void handleBehaviorPost(){
 
 void handleSchedulePost(){
   if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
-  StaticJsonDocument<512> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+  DynamicJsonDocument doc(512); if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
 
   if(doc["enabled"].is<bool>())  cfg.schedEnabled  = doc["enabled"].as<bool>();
   if(doc["days"].is<int>())      cfg.schedDays     = (uint8_t)(doc["days"].as<int>() & 0x7F);
@@ -1431,7 +1433,7 @@ void handleSchedulePost(){
 
   saveConfig();
 
-  StaticJsonDocument<512> r;
+  DynamicJsonDocument r(512);
   r["ok"]=true; r["enabled"]=cfg.schedEnabled; r["days"]=cfg.schedDays; r["wakeSecs"]=cfg.schedWakeSecs;
   JsonArray ra = r.createNestedArray("times");
   for(uint8_t i=0;i<cfg.schedTimeCount;i++) ra.add(cfg.schedTimes[i]);
@@ -1450,7 +1452,7 @@ void handleFactoryReset(){ LittleFS.remove("/config.json"); server.send(200,"app
 
 void handleFsFormat(){
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false,\"error\":\"Missing body\"}"); return; }
-  StaticJsonDocument<128> doc;
+  DynamicJsonDocument doc(128);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400,"application/json","{\"ok\":false,\"error\":\"Invalid JSON\"}");
     return;
