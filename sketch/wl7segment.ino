@@ -56,6 +56,12 @@ struct AppConfig {
   String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
   // Fahrplan-Fallback: timePlanned nutzen, wenn kein timeReal (Echtzeit) vorliegt
   bool allowPlannedFallback = true;
+  // ----- Standby-Zeitplan -----
+  bool     schedEnabled  = false;      // Zeitplan aktiv?
+  uint8_t  schedDays     = 0;          // Bitmaske: bit0=Mo, bit1=Di, ... bit6=So
+  uint32_t schedWakeSecs = 60;         // Sekunden wach nach dem Aufwecken
+  uint16_t schedTimes[8] = {0};        // Weckzeiten als Minuten seit Mitternacht (0..1439)
+  uint8_t  schedTimeCount = 0;         // Anzahl belegter Weckzeiten
 } cfg;
 
 String lastDisplayValue = "----";
@@ -72,6 +78,11 @@ unsigned long backoffMs = 20000;
 bool timeSynced = false;
 bool standby = false;
 bool usingPlanned = false; // true, wenn aktueller Countdown aus timePlanned (Fahrplan) statt timeReal stammt
+
+// Standby-Zeitplan (Laufzeit)
+unsigned long schedWakeUntil = 0;  // millis, bis wann durch Zeitplan wach
+bool schedAwake = false;           // true, wenn aktuell durch Zeitplan geweckt
+int  schedLastTriggerKey = -1;     // (wday*1440+minute) der letzten Auslösung → Dedup pro Minute
 
 bool fsMounted = false;
 
@@ -241,6 +252,18 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
 .color-row{display:flex;gap:10px;align-items:center}
 .color-chip{width:42px;height:36px;border-radius:10px;border:1px solid #2a3648}
 .color-wrap{display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:center}
+.dots{display:flex;gap:10px;flex-wrap:wrap}
+.dot{display:flex;align-items:center;gap:8px;cursor:pointer;padding:8px 12px;border:1px solid #2a3648;border-radius:999px;background:#0e1420;color:var(--dim);user-select:none}
+.dot input{appearance:none;-webkit-appearance:none;width:16px;height:16px;min-width:16px;padding:0;border-radius:50%;border:2px solid #3a4a63;margin:0;position:relative;background:#0e1420;box-shadow:none}
+.dot input:focus{outline:none;box-shadow:0 0 0 3px rgba(58,166,255,.2)}
+.dot input:checked{border-color:var(--accent)}
+.dot input:checked::after{content:"";position:absolute;top:2px;left:2px;right:2px;bottom:2px;border-radius:50%;background:var(--accent)}
+.dot input:checked ~ span{color:var(--ink)}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid #2a3648;background:#0e1420;color:var(--ink);font-variant-numeric:tabular-nums}
+.chip button{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;line-height:1;padding:0;width:auto}
+.chip button:hover{color:#ff8a8a}
+.addrow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
 </style></head><body>
 <div class="wrap grid grid-2">
   <div class="card">
@@ -340,6 +363,43 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
       <span class="badge" id="previewInfo">Vorschau entspricht Live-Countdown</span>
     </div>
   </div>
+
+  <div class="card">
+    <h1>Standby-Zeitplan</h1>
+    <p class="lead">Das Display bleibt im Standby und wacht nur zu festgelegten Zeiten auf. Einige Sekunden nach dem Aufwachen geht es wieder schlafen.</p>
+
+    <div class="flex" style="align-items:center;margin-bottom:14px">
+      <button class="btn warn" id="schedToggle">Zeitplan: aus</button>
+      <span class="badge" id="schedState">Zeitplan: aus</span>
+    </div>
+
+    <label>Wochentage</label>
+    <div class="dots" id="schedDays" style="margin-bottom:14px">
+      <label class="dot"><input type="checkbox" data-day="0"><span>Mo</span></label>
+      <label class="dot"><input type="checkbox" data-day="1"><span>Di</span></label>
+      <label class="dot"><input type="checkbox" data-day="2"><span>Mi</span></label>
+      <label class="dot"><input type="checkbox" data-day="3"><span>Do</span></label>
+      <label class="dot"><input type="checkbox" data-day="4"><span>Fr</span></label>
+      <label class="dot"><input type="checkbox" data-day="5"><span>Sa</span></label>
+      <label class="dot"><input type="checkbox" data-day="6"><span>So</span></label>
+    </div>
+
+    <label>Weckzeiten (max. 8)</label>
+    <div class="addrow">
+      <input id="schedTimeInput" type="time" value="07:30">
+      <button class="btn secondary" id="schedAddTime">+ Zeit</button>
+    </div>
+    <div class="chips" id="schedTimes" style="margin-top:10px"></div>
+
+    <div class="row" style="margin-top:14px">
+      <label for="schedWakeSecs">Wach-Dauer nach dem Aufwecken (Sekunden)</label>
+      <input id="schedWakeSecs" type="number" min="1" max="86400" step="1" placeholder="60">
+    </div>
+
+    <div class="flex" style="margin-top:14px">
+      <button class="btn" id="schedSave">Zeitplan speichern</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -363,7 +423,8 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
   const dirty = {
     cLow:false, cMid:false, cHigh:false,
     tLow:false, tMid:false,
-    brightness:false
+    brightness:false,
+    sched:false
   };
   const markDirty = key => { dirty[key] = true; };
   const clearDirtyAll = () => { Object.keys(dirty).forEach(k => dirty[k]=false); };
@@ -468,6 +529,61 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
     clearDirtyAll();
   });
 
+  // ---- Standby-Zeitplan ----
+  const m2hhmm = m => String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+  const hhmm2m = s => { const p=(s||'').split(':'); return ((+p[0]||0)*60 + (+p[1]||0)); };
+  let schedEnabled = false;
+  let schedTimesArr = [];
+
+  function setSchedToggle(v){
+    schedEnabled = !!v;
+    $('#schedToggle').dataset.state = schedEnabled ? 'on':'off';
+    $('#schedToggle').textContent = 'Zeitplan: ' + (schedEnabled?'an':'aus');
+  }
+  function getSchedDays(){
+    let d=0; document.querySelectorAll('#schedDays input[data-day]').forEach(el=>{ if(el.checked) d |= (1 << (+el.dataset.day)); }); return d;
+  }
+  function setSchedDays(mask){
+    document.querySelectorAll('#schedDays input[data-day]').forEach(el=>{ el.checked = !!(mask & (1 << (+el.dataset.day))); });
+  }
+  function renderSchedTimes(){
+    const c = $('#schedTimes'); c.innerHTML='';
+    schedTimesArr.sort((a,b)=>a-b);
+    if(schedTimesArr.length===0){ c.innerHTML='<span class="small">Noch keine Weckzeiten</span>'; return; }
+    schedTimesArr.forEach((m,idx)=>{
+      const chip=document.createElement('div'); chip.className='chip';
+      const s=document.createElement('span'); s.textContent=m2hhmm(m);
+      const b=document.createElement('button'); b.type='button'; b.textContent='×'; b.title='Entfernen';
+      b.addEventListener('click',()=>{ schedTimesArr.splice(idx,1); markDirty('sched'); renderSchedTimes(); });
+      chip.appendChild(s); chip.appendChild(b); c.appendChild(chip);
+    });
+  }
+  async function postSchedule(payload){
+    try{
+      const r = await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(!r.ok) throw new Error(r.status);
+      const j = await r.json(); setSchedToggle(!!j.enabled);
+      dirty.sched=false;
+      toast('Zeitplan gespeichert');
+    }catch(e){ toast('Fehler: '+e, false); }
+  }
+  const currentSchedPayload = (enabled)=>({
+    enabled: enabled,
+    days: getSchedDays(),
+    wakeSecs: Math.max(1, +$('#schedWakeSecs').value||60),
+    times: schedTimesArr.slice()
+  });
+  $('#schedAddTime').addEventListener('click', ()=>{
+    if(schedTimesArr.length>=8){ toast('Maximal 8 Weckzeiten', false); return; }
+    const m = hhmm2m($('#schedTimeInput').value);
+    if(!schedTimesArr.includes(m)){ schedTimesArr.push(m); markDirty('sched'); renderSchedTimes(); }
+  });
+  document.querySelectorAll('#schedDays input[data-day]').forEach(el=>el.addEventListener('change', ()=>markDirty('sched')));
+  $('#schedWakeSecs').addEventListener('input', ()=>markDirty('sched'));
+  $('#schedToggle').addEventListener('click', ()=>postSchedule(currentSchedPayload(!schedEnabled)));
+  $('#schedSave').addEventListener('click', ()=>postSchedule(currentSchedPayload(schedEnabled)));
+  renderSchedTimes();
+
   // Status holen & UI updaten (respektiert Dirty-Flags)
   async function refreshStatus(){
     try{
@@ -525,6 +641,22 @@ input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 
         if (!dirty.cMid  && s.colors.mid)  $('#cMid').value  = rgb2hex(s.colors.mid[0],  s.colors.mid[1],  s.colors.mid[2]);
         if (!dirty.cHigh && s.colors.high) $('#cHigh').value = rgb2hex(s.colors.high[0], s.colors.high[1], s.colors.high[2]);
         updateChips();
+      }
+
+      // Standby-Zeitplan
+      if (s.schedule){
+        setSchedToggle(!!s.schedule.enabled);
+        if (!dirty.sched){
+          setSchedDays(s.schedule.days || 0);
+          if (document.activeElement !== $('#schedWakeSecs')) $('#schedWakeSecs').value = s.schedule.wakeSecs ?? 60;
+          schedTimesArr = Array.isArray(s.schedule.times) ? s.schedule.times.slice() : [];
+          renderSchedTimes();
+        }
+        let st;
+        if (!s.schedule.enabled) st = 'aus';
+        else if (s.schedule.awake && typeof s.schedule.remaining === 'number' && s.schedule.remaining >= 0) st = 'wach – Standby in ' + s.schedule.remaining + 's';
+        else st = 'wartet auf Weckzeit';
+        $('#schedState').textContent = 'Zeitplan: ' + st;
       }
 
       // Karte
@@ -748,7 +880,7 @@ bool saveConfig(){
     Serial.println("saveConfig: FS not mounted");
     return false;
   }
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   doc["ssid"]=cfg.ssid; doc["password"]=cfg.password; doc["apiKey"]=cfg.apiKey; doc["rbl"]=cfg.rbl;
   doc["brightness"]=cfg.brightness; doc["ledPower"]=cfg.ledPower;
   doc["tLow"]=cfg.tLow; doc["tMid"]=cfg.tMid;
@@ -757,8 +889,14 @@ bool saveConfig(){
   JsonArray hig = doc.createNestedArray("colHigh"); hig.add(cfg.colHigh[0]); hig.add(cfg.colHigh[1]); hig.add(cfg.colHigh[2]);
   doc["httpsInsecure"]=cfg.httpsInsecure; doc["httpsFingerprint"]=cfg.httpsFingerprint;
   doc["allowPlannedFallback"]=cfg.allowPlannedFallback;
+  // Standby-Zeitplan
+  doc["schedEnabled"]=cfg.schedEnabled;
+  doc["schedDays"]=cfg.schedDays;
+  doc["schedWakeSecs"]=cfg.schedWakeSecs;
+  JsonArray st = doc.createNestedArray("schedTimes");
+  for(uint8_t i=0;i<cfg.schedTimeCount;i++) st.add(cfg.schedTimes[i]);
 
-  String json; json.reserve(768);
+  String json; json.reserve(1024);
   size_t want = serializeJson(doc, json);
   if (want == 0){ Serial.println("saveConfig: serializeJson produced 0B"); return false; }
 
@@ -846,7 +984,7 @@ void loadConfig(){
   Serial.print("config.json preview: ");
   Serial.println(raw);
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1280> doc;
   DeserializationError err = deserializeJson(doc, raw);
   if(err){
     Serial.print("Config JSON parse failed: "); Serial.println(err.c_str());
@@ -876,6 +1014,19 @@ void loadConfig(){
   cfg.httpsInsecure    = doc["httpsInsecure"]    | false;
   cfg.httpsFingerprint = doc["httpsFingerprint"] | "";
   cfg.allowPlannedFallback = doc["allowPlannedFallback"] | true;
+
+  // Standby-Zeitplan
+  cfg.schedEnabled  = doc["schedEnabled"]  | false;
+  cfg.schedDays     = (uint8_t)((int)(doc["schedDays"] | 0) & 0x7F);
+  cfg.schedWakeSecs = doc["schedWakeSecs"] | 60;
+  cfg.schedTimeCount = 0;
+  if (doc["schedTimes"].is<JsonArray>()){
+    for (JsonVariant v : doc["schedTimes"].as<JsonArray>()){
+      if (cfg.schedTimeCount >= 8) break;
+      int m = v.as<int>();
+      if (m >= 0 && m <= 1439) cfg.schedTimes[cfg.schedTimeCount++] = (uint16_t)m;
+    }
+  }
 
   Serial.println("---LittleFS Konfig geladen---");
 }
@@ -1099,7 +1250,7 @@ void applyLedState(){
 void serveIndex(){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); }
 
 void handleStatus(){
-  StaticJsonDocument<1536> doc;
+  StaticJsonDocument<1792> doc;
   doc["ip"] = (WiFi.status()==WL_CONNECTED)? WiFi.localIP().toString() : "";
   doc["rssi"] = (WiFi.status()==WL_CONNECTED)? WiFi.RSSI() : 0;
   doc["lastDisplay"] = lastDisplayValue;
@@ -1132,6 +1283,19 @@ void handleStatus(){
   doc["allowPlannedFallback"] = cfg.allowPlannedFallback;
   doc["usingPlanned"] = usingPlanned;               // aktueller Wert stammt aus dem Fahrplan
   doc["httpsInsecure"] = cfg.httpsInsecure; doc["httpsFingerprint"] = cfg.httpsFingerprint;
+
+  // Standby-Zeitplan
+  JsonObject sch = doc["schedule"].to<JsonObject>();
+  sch["enabled"]  = cfg.schedEnabled;
+  sch["days"]     = cfg.schedDays;
+  sch["wakeSecs"] = cfg.schedWakeSecs;
+  sch["awake"]    = schedAwake;
+  JsonArray sct = sch["times"].to<JsonArray>();
+  for (uint8_t i=0;i<cfg.schedTimeCount;i++) sct.add(cfg.schedTimes[i]);
+  long schRemain = -1;
+  if (schedAwake) { long d = (long)(schedWakeUntil - millis()); schRemain = d > 0 ? d/1000 : 0; }
+  sch["remaining"] = schRemain;
+
   doc["loglen"] = ringLog.length();
   String out; serializeJson(doc,out);
   server.send(200,"application/json", out);
@@ -1209,6 +1373,7 @@ void handleDisplayPost(){
     else if(m=="off") mode=DisplayMode::OFF;
     else if(m=="minus") mode=DisplayMode::MINUS;
     else if(m=="standby") { standby=true; mode=DisplayMode::STANDBY; }
+    schedAwake = false; // manuelle Steuerung hat Vorrang vor dem Zeitplan-Auto-Sleep
   }
   saveConfig(); applyLedState(); server.send(200,"application/json","{\"ok\":true}");
 }
@@ -1218,6 +1383,7 @@ void handleStandbyPost(){
   StaticJsonDocument<200> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
   if(doc["standby"].is<bool>()){
     standby = doc["standby"].as<bool>();
+    schedAwake = false; // manuelle Steuerung hat Vorrang vor dem Zeitplan-Auto-Sleep
     if(standby){ mode=DisplayMode::STANDBY; displayClear(); }
     else { if(mode==DisplayMode::STANDBY) mode=DisplayMode::COUNTDOWN; nextPollAt = millis()+500; }
   }
@@ -1233,6 +1399,43 @@ void handleBehaviorPost(){
   // Direkt neu abfragen, damit die Umschaltung sofort greift
   nextPollAt = millis();
   String out = String("{\"ok\":true,\"plannedFallback\":") + (cfg.allowPlannedFallback?"true":"false") + "}";
+  server.send(200,"application/json", out);
+}
+
+void handleSchedulePost(){
+  if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return; }
+  StaticJsonDocument<512> doc; if(deserializeJson(doc, server.arg("plain"))){ server.send(400,"text/plain","Invalid JSON"); return; }
+
+  if(doc["enabled"].is<bool>())  cfg.schedEnabled  = doc["enabled"].as<bool>();
+  if(doc["days"].is<int>())      cfg.schedDays     = (uint8_t)(doc["days"].as<int>() & 0x7F);
+  if(doc["wakeSecs"].is<int>())  cfg.schedWakeSecs = (uint32_t)constrain((long)doc["wakeSecs"].as<int>(), 1L, 86400L);
+  if(doc["times"].is<JsonArray>()){
+    cfg.schedTimeCount = 0;
+    for(JsonVariant v : doc["times"].as<JsonArray>()){
+      if(cfg.schedTimeCount >= 8) break;
+      int m = v.as<int>();
+      if(m >= 0 && m <= 1439) cfg.schedTimes[cfg.schedTimeCount++] = (uint16_t)m;
+    }
+  }
+
+  // Zustand nach Konfigurationsänderung neu setzen
+  schedLastTriggerKey = -1;   // erlaubt sofortiges Auslösen, falls jetzt gerade eine Weckzeit passt
+  schedAwake = false;
+  if(cfg.schedEnabled){
+    // Zeitplan aktiv → Gerät geht in Standby, die nächste Weckzeit weckt es
+    standby = true; mode = DisplayMode::STANDBY; displayClear();
+  } else {
+    // Zeitplan aus → Display normal aktivieren
+    standby = false; if(mode==DisplayMode::STANDBY) mode = DisplayMode::COUNTDOWN; nextPollAt = millis();
+  }
+
+  saveConfig();
+
+  StaticJsonDocument<512> r;
+  r["ok"]=true; r["enabled"]=cfg.schedEnabled; r["days"]=cfg.schedDays; r["wakeSecs"]=cfg.schedWakeSecs;
+  JsonArray ra = r.createNestedArray("times");
+  for(uint8_t i=0;i<cfg.schedTimeCount;i++) ra.add(cfg.schedTimes[i]);
+  String out; serializeJson(r, out);
   server.send(200,"application/json", out);
 }
 
@@ -1312,6 +1515,7 @@ void setup(){
   server.on("/api/standby",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/fs-format",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
   server.on("/api/behavior",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
+  server.on("/api/schedule",HTTP_OPTIONS, [](){ addCORS(); server.send(204); });
 
   server.on("/api/config", HTTP_POST, [](){ addCORS(); handleConfigPost(); });
   server.on("/api/led", HTTP_POST, [](){ addCORS(); handleLedPost(); });
@@ -1320,11 +1524,18 @@ void setup(){
   server.on("/api/factoryreset", HTTP_POST, [](){ addCORS(); handleFactoryReset(); });
   server.on("/api/standby", HTTP_POST, [](){ addCORS(); handleStandbyPost(); });
   server.on("/api/behavior", HTTP_POST, [](){ addCORS(); handleBehaviorPost(); });
+  server.on("/api/schedule", HTTP_POST, [](){ addCORS(); handleSchedulePost(); });
   server.on("/api/fs-format", HTTP_POST, [](){ addCORS(); handleFsFormat(); });
 
   server.on("/status-log", HTTP_GET, [](){ addCORS(); server.send(200,"text/plain", ringLog); });
 
   server.begin(); logLine("HTTP server started");
+
+  // Bei aktivem Zeitplan startet das Gerät im Standby und wacht erst zur nächsten Weckzeit auf
+  if(cfg.schedEnabled){
+    standby = true; mode = DisplayMode::STANDBY;
+    logLine("Zeitplan aktiv → Start im Standby");
+  }
 
   applyLedState();
   nextTickAt = millis() + 1000;
@@ -1334,6 +1545,56 @@ void setup(){
 void loop(){
   server.handleClient();
   ArduinoOTA.handle();
+
+  // ---- Standby-Zeitplan ----
+  if(cfg.schedEnabled){
+    // Für den Zeitplan wird die Uhrzeit benötigt – im Standby regelmäßig nachsynchronisieren
+    static unsigned long nextTimeCheck = 0;
+    if(!timeSynced && millis() >= nextTimeCheck){
+      nextTimeCheck = millis() + 30000;
+      ensureWifi();
+      ensureTime();
+    }
+
+    time_t now = time(nullptr);
+    if(timeSynced && now >= TIME_VALID_EPOCH){
+      struct tm lt; localtime_r(&now, &lt);
+      int wd = (lt.tm_wday + 6) % 7;              // Mo=0 ... So=6
+      int minOfDay = lt.tm_hour * 60 + lt.tm_min;
+      int curKey = wd * 1440 + minOfDay;
+
+      // Re-Arm: sobald wir die ausgelöste Minute verlassen, erneut scharf schalten
+      if(schedLastTriggerKey != -1 && schedLastTriggerKey != curKey) schedLastTriggerKey = -1;
+
+      // Aufwecken (flankengesteuert: pro Minute nur einmal)
+      if(cfg.schedDays & (1 << wd)){
+        for(uint8_t i=0; i<cfg.schedTimeCount; i++){
+          if((int)cfg.schedTimes[i] == minOfDay){
+            if(schedLastTriggerKey != curKey){
+              schedLastTriggerKey = curKey;
+              schedAwake = true;
+              schedWakeUntil = millis() + (unsigned long)cfg.schedWakeSecs * 1000UL;
+              standby = false;
+              if(mode == DisplayMode::STANDBY) mode = DisplayMode::COUNTDOWN;
+              nextPollAt = millis();  // sofort neue Daten holen
+              char hhmm[6]; sprintf(hhmm, "%02d:%02d", lt.tm_hour, lt.tm_min);
+              logLine(String("Zeitplan: Aufgeweckt um ") + hhmm + " für " + String(cfg.schedWakeSecs) + "s");
+            }
+            break;
+          }
+        }
+      }
+
+      // Wieder schlafen legen
+      if(schedAwake && millis() >= schedWakeUntil){
+        schedAwake = false;
+        standby = true;
+        mode = DisplayMode::STANDBY;
+        displayClear();
+        logLine("Zeitplan: Wachzeit abgelaufen → Standby");
+      }
+    }
+  }
 
   // 1s LED/Anzeige tick
   if(millis() >= nextTickAt){
