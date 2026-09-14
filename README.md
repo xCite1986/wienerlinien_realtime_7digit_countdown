@@ -17,6 +17,7 @@ sowie eine **REST-API** zur Steuerung.
   - WLAN & API-Key Setup
   - Konfigurationsmöglichkeiten der LED-Farben, dessen Schwellwerte und Helligkeit
   - Standby-Modus/LED on/off
+  - **Standby-Zeitplan**: Wochentage + Weckzeiten wählen, Display wacht automatisch auf und geht nach X Sekunden wieder in Standby
   - Live-Countdown + API-Log
   - OpenStreetMap-Karte der Haltestelle
 - REST-API (siehe unten)  
@@ -125,6 +126,7 @@ Die Firmware bietet eine REST-Schnittstelle:
 | `/api/led`           | POST    | LED-Einstellungen (Helligkeit, Farben)       |
 | `/api/display`       | POST    | Anzeige-Modus (countdown, off, minus, standby) |
 | `/api/standby`       | POST    | Standby ein/aus                              |
+| `/api/schedule`      | POST    | Standby-Zeitplan (Wochentage, Weckzeiten, Wachdauer) |
 | `/api/fetch-now`     | POST    | Sofort neue API-Abfrage                      |
 | `/api/fs-format`     | POST    | LittleFS formatieren                         |
 | `/api/last-payload`  | GET     | Letzte Rohantwort der Wiener Linien API      |
@@ -184,6 +186,29 @@ Einfacher Shortcut, um Standby ein- oder auszuschalten.
 ```bash
 curl -X POST http://wldisplay.local/api/standby   -H "Content-Type: application/json"   -d '{"enabled": true}'
 ```
+
+---
+
+## ⏰ /api/schedule  
+Konfiguriert den Standby-Zeitplan. Das Gerät bleibt im Standby und wacht nur zu den
+angegebenen Weckzeiten an den gewählten Wochentagen auf; `wakeSecs` Sekunden nach dem
+Aufwachen kehrt es in den Standby zurück.
+
+- `enabled`: Zeitplan aktiv (bei `true` geht das Gerät sofort in Standby)
+- `days`: Bitmaske der Wochentage – `bit0=Mo, bit1=Di, … bit6=So` (z. B. `31` = Mo–Fr)
+- `times`: Array von Weckzeiten als **Minuten seit Mitternacht** (max. 8; `450` = 07:30)
+- `wakeSecs`: Sekunden, die das Display nach dem Aufwachen aktiv bleibt
+
+```bash
+curl -X POST http://wldisplay.local/api/schedule   -H "Content-Type: application/json"   -d '{
+    "enabled": true,
+    "days": 31,
+    "times": [450, 720, 1020],
+    "wakeSecs": 60
+  }'
+```
+
+Der aktuelle Zeitplan-Status (inkl. Restwachzeit) steht auch in `/api/status` unter `schedule`.
 
 ---
 
